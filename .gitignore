@@ -1,0 +1,67 @@
+# Local Python environments and runtime
+.venv/
+venv/
+env/
+.runtime/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Test caches, coverage, and local verification runs
+.pytest_*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+/.manual_*/
+/.process_temp_*/
+
+# Local reconciliation data and exported reports
+/data/
+/exports/
+
+# Credentials and local environment settings
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Editor and operating system artifacts
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+~$*
+
+# Additional local development artifacts
+/.agents/
+/.pytest_cache/
+
+# Prevent accidental upload of production data files
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.db
+
+# Allow reviewed synthetic test samples
+!/samples/
+!/samples/**/*.csv
+!/samples/**/*.xlsx
+!/samples/**/*.xls
+
+# Additional local output directories
+/output/
+/outputs/
+/reports/
+/temp/
+/tmp/
