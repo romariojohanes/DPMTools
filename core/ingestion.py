@@ -1,24 +1,27 @@
 """Strict ingestion: DuckDB CSV scans, bounded XLSX batches, no Pandas."""
 import csv
 import hashlib
-import shutil
 from xml.etree.ElementTree import iterparse
 from zipfile import ZipFile
 from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
 
+import duckdb
 from openpyxl import load_workbook
 
+from core.monitoring import OperationStopped
 from core.schema import FIELDS, IDENTIFIERS, NULLS, NUMERIC, REQUIRED_VALUES, InputOptions, canonical, quote
 from core.xlsx_stream import streaming_workbook
 
 
-def _sha256(path, block_size=4 * 1024 * 1024):
+def _sha256(path, block_size=4 * 1024 * 1024, checkpoint=None):
     started = perf_counter()
     digest = hashlib.sha256()
     with Path(path).open('rb') as handle:
         while block := handle.read(block_size):
+            if checkpoint:
+                checkpoint()
             digest.update(block)
     return digest.hexdigest(), perf_counter() - started
 
@@ -155,33 +158,41 @@ def _csv(run, source, path, options):
         if options.encoding.lower().replace('_', '-') not in ('utf-8', 'utf-8-sig', 'utf8'):
             converted = run.directory / 'transcoded.csv'
             with path.open('r', encoding=options.encoding, newline='') as src, converted.open('w', encoding='utf-8', newline='') as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                while block := src.read(1024 * 1024):
+                    run.checkpoint()
+                    dst.write(block)
             scan = converted
         cols = '{' + ','.join(f'{quote(name)}: \'VARCHAR\'' for name in headers) + '}'
         projection = ','.join('"' + f + '"' for f in FIELDS)
-        # Explicit columns prevent type inference or header-driven identifier corruption.
+        # Stream two ordered CSV readers together. A full-file temporary copy and
+        # a hash table of every provenance ordinal are unnecessary for this zip.
+        # Explicit columns still prevent type inference/identifier corruption.
         run.emit('csv_scan', source=source, source_file=str(path))
-        sql = f'''CREATE OR REPLACE TEMP TABLE stage AS
-            SELECT {projection}, {quote(str(path))} AS source_file, '' AS source_sheet,
-                   row_number() OVER () + 1 AS source_row
-            FROM read_csv({quote(str(scan))}, columns={cols}, header=true, auto_detect=false,
-                delim={quote(options.delimiter)}, quote='"', escape='"', parallel=false,
-                strict_mode=true, ignore_errors=false, null_padding=false, nullstr='')'''
-        run.con.execute(sql)
-        count = run.con.execute('SELECT count(*) FROM stage').fetchone()[0]
-        if count != ordinal:
-            raise ValueError('CSV reader/provenance row counts disagree; no rows accepted.')
-        # Stage source_row is the record ordinal + 1 until mapped to physical lines.
         target_columns = ','.join('"' + f + '"' for f in FIELDS + ['source_file', 'source_sheet', 'source_row'])
-        run.con.execute(f'''INSERT INTO raw_{source} ({target_columns})
-            SELECT {','.join('s."' + f + '"' for f in FIELDS)}, s.source_file, s.source_sheet, p.source_row
-            FROM stage s JOIN read_csv({quote(str(row_map))}, header=true,
-                columns={{'record_number':'BIGINT','source_row':'BIGINT'}}) p
-            ON s.source_row=p.record_number+1''')
+        sql = f'''INSERT INTO raw_{source} ({target_columns})
+            SELECT {','.join('s."' + f + '"' for f in FIELDS)}, {quote(str(path))}, '',
+                   CASE WHEN s.__dpm_record_present IS NULL OR p.source_row IS NULL
+                        THEN error('CSV reader/provenance row counts disagree; no rows accepted.')
+                        ELSE p.source_row END
+            FROM (SELECT {projection}, true AS __dpm_record_present
+                  FROM read_csv({quote(str(scan))}, columns={cols}, header=true, auto_detect=false,
+                      delim={quote(options.delimiter)}, quote='"', escape='"', parallel=false,
+                      strict_mode=true, ignore_errors=false, null_padding=false, nullstr='')) s
+            POSITIONAL JOIN read_csv({quote(str(row_map))}, header=true, auto_detect=false,
+                parallel=false, columns={{'record_number':'BIGINT','source_row':'BIGINT'}}) p'''
+        run.con.execute('BEGIN TRANSACTION')
+        try:
+            count = run.con.execute(sql).fetchone()[0]
+            if count != ordinal:
+                raise ValueError('CSV reader/provenance row counts disagree; no rows accepted.')
+            run.checkpoint()
+            run.con.execute('COMMIT')
+        except Exception:
+            run.con.execute('ROLLBACK')
+            raise
         run.emit('csv_scan', source=source, source_file=str(path), records=count)
         return count, ''
     finally:
-        run.con.execute('DROP TABLE IF EXISTS stage')
         if converted:
             converted.unlink(missing_ok=True)
         row_map.unlink(missing_ok=True)
@@ -270,17 +281,18 @@ def ingest(run, source, paths, options: InputOptions):
     run.con.execute(f'CREATE SEQUENCE raw_{source}_sequence START 1')
     run.con.execute(f"CREATE TABLE raw_{source} ({definitions}, source_file VARCHAR, source_sheet VARCHAR, source_row BIGINT, native_numeric VARCHAR DEFAULT '', ingest_id BIGINT DEFAULT nextval('raw_{source}_sequence'))")
     for path in paths:
+        run.checkpoint()
         path = Path(path)
         before = path.stat()
         record = {'source': source, 'filename': path.name, 'path': str(path), 'bytes': before.st_size,
                   'modified_ns': before.st_mtime_ns, 'rows': 0, 'sheet': '', 'status': 'FAILED'}
         try:
-            record['sha256_before'], before_hash_seconds = _sha256(path)
+            record['sha256_before'], before_hash_seconds = _sha256(path, checkpoint=run.checkpoint)
             record['sha256_seconds'] = before_hash_seconds
             run.emit('ingestion', source=source, source_file=str(path))
             record['rows'], record['sheet'] = (_csv if path.suffix.lower() == '.csv' else _xlsx)(run, source, path, options)
             after = path.stat()
-            record['sha256_after'], after_hash_seconds = _sha256(path)
+            record['sha256_after'], after_hash_seconds = _sha256(path, checkpoint=run.checkpoint)
             record['sha256_seconds'] += after_hash_seconds
             record['sha256_verified'] = record['sha256_before'] == record['sha256_after']
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
@@ -290,11 +302,22 @@ def ingest(run, source, paths, options: InputOptions):
             record['status'] = 'READ'
             if record['rows'] == 0:
                 _issue(run, source, path, record['sheet'], None, '', None, 'EMPTY_FILE', 'Input contains no CDR rows.')
+        except (duckdb.InterruptException, OperationStopped) as exc:
+            record.update(status='INTERRUPTED', error=str(exc), error_type=type(exc).__name__)
+            _issue(run, source, path, '', None, '', None, 'INGESTION_INTERRUPTED', str(exc))
+            raise
         except Exception as exc:
+            # A stop can coincide with a parser/I/O error; it still ends the run.
+            try:
+                run.checkpoint()
+            except OperationStopped as stop:
+                record.update(status='INTERRUPTED', error=str(stop), error_type=type(stop).__name__)
+                _issue(run, source, path, '', None, '', None, 'INGESTION_INTERRUPTED', str(stop))
+                raise stop from exc
             record['error'] = str(exc)
             _issue(run, source, path, '', None, '', None, 'FILE_ERROR', str(exc))
         finally:
-            if 'sha256_after' not in record and path.exists():
+            if record['status'] != 'INTERRUPTED' and 'sha256_after' not in record and path.exists():
                 try:
                     record['sha256_after'], seconds = _sha256(path)
                     record['sha256_seconds'] = record.get('sha256_seconds', 0) + seconds
@@ -305,8 +328,8 @@ def ingest(run, source, paths, options: InputOptions):
             (run.directory / 'csv_rows.csv').unlink(missing_ok=True)
             (run.directory / 'xlsx_stage.csv').unlink(missing_ok=True)
             (run.directory / 'xlsx_issues.csv').unlink(missing_ok=True)
-        run.meta['files'].append(record)
-        run.save()
+            run.meta['files'].append(record)
+            run.save()
     run.emit('normalization', source=source)
     normalize(run, source, options)
 
@@ -320,7 +343,6 @@ def normalize(run, source, options):
         if field in ('HPMN', 'VPMN', 'CURRENCY', 'SERVICE_TYPE'):
             value = f'upper({value})'
         clean.append(f'{value} AS "{field}"')
-    originals = ','.join(f'{f} := "{f}"' for f in FIELDS)
     numeric_updates = []
     for field in NUMERIC:
         ref = f'"{field}"'
@@ -366,8 +388,14 @@ def normalize(run, source, options):
             if field == 'CURRENCY':
                 errors.append((field, f"{ref} IS NOT NULL AND NOT regexp_full_match({ref}, '[A-Z]{{3}}')", 'INVALID_CURRENCY', 'Currency must be a three-letter code.'))
             typed.append(ref)
+    # Retain original text only for fields that can emit a validation issue.
+    # All 24 originals remain in raw_<source>; copying the others into every
+    # chunk's nested struct provides no validation or normalization benefit.
+    checked_fields = {field for field, *_ in errors}
+    original_fields = [field for field in FIELDS if field in checked_fields]
+    originals = ','.join(f'{f} := "{f}"' for f in original_fields)
     checks = ','.join(f'CASE WHEN {condition} THEN struct_pack(field := {quote(field)}, code := {quote(code)}, message := {quote(message)}) END' for field, condition, code, message in errors)
-    raw_map = 'map([' + ','.join(quote(f) for f in FIELDS) + '],[' + ','.join('c.original."' + f + '"' for f in FIELDS) + '])'
+    raw_map = 'map([' + ','.join(quote(f) for f in original_fields) + '],[' + ','.join('c.original."' + f + '"' for f in original_fields) + '])'
     maximum = run.con.execute(f'SELECT max(ingest_id) FROM raw_{source}').fetchone()[0] or 0
     chunk = run.settings.normalization_chunk_rows
     observed_fractional_digits = 0
@@ -406,8 +434,8 @@ def normalize(run, source, options):
             created = True
         else:
             run.con.execute(f'INSERT INTO {source} {select}')
-        run.emit('normalization', source=source, records=upper)
         run.con.execute('DROP TABLE cleaned')
+        run.emit('normalization', source=source, records=upper)
     run.meta.setdefault('decimal_requirements', {})[source] = {
         'observed_fractional_digits': observed_fractional_digits,
         'configured_scale': run.settings.decimal_scale,

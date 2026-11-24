@@ -18,7 +18,7 @@ def validation_summary(run):
     for record in run.meta['files']:
         found = run.con.execute('SELECT issue_count, invalid_rows FROM validation_files WHERE source=? AND source_file=?', [record['source'], record['path']]).fetchone()
         record['issue_count'], record['invalid_rows'] = found or (0, 0)
-        if found:
+        if found and record['status'] != 'INTERRUPTED':
             record['status'] = 'INVALID'
         elif record['status'] == 'READ':
             record['status'] = 'VALID'
@@ -44,6 +44,7 @@ def execute(legacy_paths, saas_paths, *, legacy_options=None, saas_options=None,
     run.save()
     try:
         monitor.start()
+        run.safety_check = monitor.raise_if_stopped
         for source, paths, options in (('legacy', legacy, legacy_options or InputOptions()), ('saas', saas, saas_options or InputOptions())):
             ingest(run, source, paths, options)
             if traffic_date:
@@ -79,16 +80,29 @@ def execute(legacy_paths, saas_paths, *, legacy_options=None, saas_options=None,
                 # Keep one normalized copy, read through DuckDB directly from Parquet.
                 run.con.execute(f'DROP TABLE {source}')
                 run.con.execute(f'CREATE VIEW {source} AS SELECT * FROM read_parquet({quote(str(parquet))})')
+            monitor.checkpoint()
             run.meta['status'] = 'COMPLETED'
     except Exception as exc:
         run.meta['status'] = ('CANCELLED' if monitor.stop_reason == 'USER_CANCELLED' else
                               'ABORTED_RESOURCE_LIMIT' if monitor.stop_reason else 'FAILED')
         run.meta.pop('result', None)
+        run.meta.pop('aggregate_result', None)
         run.meta['error'] = str(exc)
+        run.meta['error_type'] = type(exc).__name__
+        run.meta['failure_stage'] = run.current_stage
+        run.meta['stop_reason'] = monitor.stop_reason
         run.con.execute('INSERT INTO issues VALUES (?,?,?,?,?,?,?,?)', ['run', '', '', None, '', None, 'RUN_ERROR', str(exc)])
         validation_summary(run)
     finally:
+        run.safety_check = None  # Final diagnostics must run even after a stop.
         monitor.finish()
+        # Catch a monitor stop that raced with the final worker checkpoint.
+        if monitor.stop_reason and run.meta['status'] in ('COMPLETED', 'VALIDATION_FAILED'):
+            run.meta['status'] = 'CANCELLED' if monitor.stop_reason == 'USER_CANCELLED' else 'ABORTED_RESOURCE_LIMIT'
+            run.meta.pop('result', None)
+            run.meta.pop('aggregate_result', None)
+            run.meta['stop_reason'] = monitor.stop_reason
+            run.meta['error'] = f'Resource monitor stopped the operation: {monitor.stop_reason}.'
         run.emit('finished')
         run.meta['completed_at'] = datetime.now(timezone.utc).isoformat()
         run.meta['processing_seconds'] = round(perf_counter() - started, 3)

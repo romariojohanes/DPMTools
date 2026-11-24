@@ -23,6 +23,7 @@ class Run:
             self.meta = json.loads(self.meta_path.read_text(encoding='utf-8'))
         self.settings = Settings(**self.meta['settings'])
         self.progress = None
+        self.safety_check = None
         self.started = perf_counter()
         self.stage_started = self.started
         self.current_stage = None
@@ -90,7 +91,12 @@ class Run:
     def issue_count(self):
         return self.con.execute('SELECT count(*) FROM issues').fetchone()[0]
 
+    def checkpoint(self):
+        if self.safety_check:
+            self.safety_check()
+
     def emit(self, stage, **details):
+        self.checkpoint()
         now = perf_counter()
         if stage != self.current_stage:
             if self.current_stage:

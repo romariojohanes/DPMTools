@@ -1,10 +1,13 @@
 from pathlib import Path
+from threading import Event
 from time import monotonic, sleep
 
 from streamlit.testing.v1 import AppTest
 
 from core.reporting import REPORTS
+from core.engine import Run
 from core.schema import FIELDS
+from core.workflow import execute
 from tools.generate_samples import cdr, write_csv
 
 
@@ -40,10 +43,14 @@ def test_successful_run_and_all_pages(tmp_path, monkeypatch):
     monkeypatch.setenv('DPM_RUN_ROOT', str(tmp_path / 'runs'))
     app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py')).run(timeout=30)
     app.button[0].click().run()
+    assert app.number_input(key='normalization_chunk_rows').value == 250_000
+    app.number_input(key='normalization_chunk_rows').set_value(10_000)
     next(b for b in app.button if b.label == 'Start reconciliation').click().run(timeout=60)
     finish_processing(app)
     assert not app.exception
     assert app.success
+    with Run(next((tmp_path / 'runs').iterdir())) as saved_run:
+        assert saved_run.settings.normalization_chunk_rows == 10_000
     assert len(app.metric) == 3
     for page in ['HPMN Comparison', 'VPMN Comparison', 'HPMN/VPMN Drill-down', 'CDR Matching Summary',
                  'Rating Differences', 'Legacy Only', 'SaaS Only', 'Duplicate / Ambiguous Keys',
@@ -90,6 +97,24 @@ def test_background_input_error_remains_visible(tmp_path, monkeypatch):
     finish_processing(app)
     assert not app.exception
     assert any('Input does not exist' in error.value for error in app.error)
+
+
+def test_cancelled_run_does_not_instruct_user_to_correct_csv(tmp_path, monkeypatch):
+    root = tmp_path / 'runs'
+    left = write_csv(tmp_path / 'legacy.csv', [cdr()])
+    right = write_csv(tmp_path / 'saas.csv', [cdr()])
+    cancelled = Event()
+    cancelled.set()
+    directory = execute([left], [right], root=root, cancel_event=cancelled)
+    monkeypatch.setenv('DPM_RUN_ROOT', str(root))
+    app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py')).run(timeout=30)
+    app.sidebar.radio[0].set_value('Executive Summary').run()
+    assert not app.exception
+    assert any('CANCELLED' in error.value for error in app.error)
+    assert any('USER_CANCELLED' in message.value for message in app.info)
+    assert not any('correct the source files' in message.value for message in app.info)
+    with Run(directory) as run:
+        assert 'result' not in run.meta
 
 
 def test_user_configurable_legacy_and_saas_mapping(tmp_path, monkeypatch):

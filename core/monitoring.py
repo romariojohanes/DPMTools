@@ -13,6 +13,10 @@ from time import monotonic, process_time
 GIB = 1024 ** 3
 
 
+class OperationStopped(RuntimeError):
+    """A latched cancellation/resource stop, never an input validation error."""
+
+
 def _directory_bytes(path: Path) -> int:
     total = 0
     try:
@@ -83,6 +87,7 @@ class ResourceMonitor:
         self.settings = run.settings
         self.stop_event = threading.Event()
         self.sample_lock = threading.Lock()
+        self.stop_lock = threading.Lock()
         self.thread = None
         self.samples = []
         self.elapsed_offset = 0.0
@@ -95,6 +100,7 @@ class ResourceMonitor:
             except (OSError, ValueError, TypeError):
                 self.samples = []
         self.stop_reason = None
+        self.stop_details = None
         self.cancel_event = cancel_event
         self.started = monotonic()
         self.previous_wall = self.started
@@ -123,6 +129,8 @@ class ResourceMonitor:
             temp_disk_free_bytes=disk.free,
             stage=self.run.current_stage,
         )
+        progress = self.run.meta.get('progress', {})
+        values.update({key: progress[key] for key in ('source', 'source_file', 'records') if key in progress})
         run_disk = shutil.disk_usage(self.run.directory)
         values['run_disk_free_bytes'] = run_disk.free
         values['disk_free_bytes'] = min(disk.free, run_disk.free)
@@ -147,41 +155,50 @@ class ResourceMonitor:
             return 'ELAPSED_TIME_LIMIT'
         return None
 
+    def raise_if_stopped(self):
+        """Cheap worker checkpoint, including while DuckDB has no active query."""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self._stop('USER_CANCELLED')
+        # Wait for an in-flight interrupt before writing failure diagnostics.
+        with self.stop_lock:
+            reason = self.stop_reason
+        if reason:
+            raise OperationStopped(f'Resource monitor stopped the operation: {reason}.')
+
+    def _stop(self, reason, sample=None, *, interrupt=False):
+        with self.stop_lock:
+            if self.stop_reason or (interrupt and self.stop_event.is_set()):
+                return
+            self.stop_details = dict(reason=reason, stage=self.run.current_stage,
+                                     progress=dict(self.run.meta.get('progress', {})), sample=sample)
+            self.stop_reason = reason
+            self.stop_event.set()
+            if interrupt:
+                self.run.con.interrupt()
+
     def checkpoint(self):
         """Sample immediately and make asynchronous limit/cancellation stops observable."""
-        if self.stop_reason:
-            raise RuntimeError(f'Resource monitor stopped the operation: {self.stop_reason}.')
-        if self.cancel_event is not None and self.cancel_event.is_set():
-            self.stop_reason = 'USER_CANCELLED'
-            self.run.con.interrupt()
-            raise RuntimeError('Operation cancelled by user.')
+        self.raise_if_stopped()
         sample = self._sample()
         self.samples.append(sample)
         reason = self._limit_reason(sample)
         if reason:
-            self.stop_reason = reason
-            self.run.con.interrupt()
-            raise RuntimeError(f'Resource limit reached: {reason}.')
+            self._stop(reason, sample)
+        self.raise_if_stopped()
         return sample
 
     def _run(self):
         while not self.stop_event.wait(self.settings.monitor_interval_seconds):
+            if self.stop_reason:
+                return
             if self.cancel_event is not None and self.cancel_event.is_set():
-                self.stop_reason = 'USER_CANCELLED'
-                try:
-                    self.run.con.interrupt()
-                finally:
-                    self.stop_event.set()
+                self._stop('USER_CANCELLED', interrupt=True)
                 return
             sample = self._sample()
             self.samples.append(sample)
             reason = self._limit_reason(sample)
             if reason:
-                self.stop_reason = reason
-                try:
-                    self.run.con.interrupt()
-                finally:
-                    self.stop_event.set()
+                self._stop(reason, sample, interrupt=True)
 
     def start(self):
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -204,7 +221,8 @@ class ResourceMonitor:
                    'write_bytes', 'available_memory_bytes', 'temp_bytes', 'run_bytes', 'disk_free_bytes',
                    'temp_disk_free_bytes', 'run_disk_free_bytes', 'read_bytes_per_second',
                    'write_bytes_per_second', 'cpu_percent')
-        summary = {'sample_count': len(self.samples), 'stop_reason': self.stop_reason}
+        summary = {'sample_count': len(self.samples), 'stop_reason': self.stop_reason,
+                   'stop_details': self.stop_details}
         for key in numeric:
             found = [s[key] for s in self.samples if s.get(key) is not None]
             if found:

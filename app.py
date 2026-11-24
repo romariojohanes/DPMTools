@@ -144,7 +144,8 @@ if st.session_state.pop('start_requested', False):
                               max_temp_directory_size=state['max_temp_directory_size'],
                               free_space_reserve_gb=int(state['free_space_reserve_gb']),
                               process_memory_limit_gb=int(state['process_memory_limit_gb']),
-                              available_memory_floor_gb=int(state['available_memory_floor_gb'])), root=RUNS,
+                              available_memory_floor_gb=int(state['available_memory_floor_gb']),
+                              normalization_chunk_rows=int(state.get('normalization_chunk_rows', 250_000))), root=RUNS,
             progress=latest_progress, cancel_event=state['job_cancel'])
         if not summary_mode:
             worker_kwargs.update(traffic_date=state['traffic_date'] if state['constrain_date'] else None,
@@ -351,9 +352,12 @@ if page == 'New Reconciliation':
         max_temporary = st.text_input('Maximum DuckDB temporary storage', '20GB', key='max_temp_directory_size')
         scale = int(st.number_input('Exact DECIMAL fractional digits', min_value=0, max_value=30, value=12, key='decimal_scale'))
         threads = int(st.number_input('DuckDB threads', min_value=1, max_value=32, value=4, key='threads'))
-        reserve = int(st.number_input('Minimum free disk space (GB)', min_value=1, value=50, key='free_space_reserve_gb'))
-        process_limit = int(st.number_input('Process working-set stop limit (GB)', min_value=1, value=14, key='process_memory_limit_gb'))
-        available_floor = int(st.number_input('Available system memory floor (GB)', min_value=1, value=4, key='available_memory_floor_gb'))
+        st.number_input('Normalization rows per chunk', min_value=10_000, max_value=2_000_000,
+                        value=250_000, step=10_000, key='normalization_chunk_rows', disabled=summary_mode)
+        st.caption('Smaller normalization chunks use less memory and can take longer.')
+        reserve = int(st.number_input('Minimum free disk space (GiB)', min_value=1, value=50, key='free_space_reserve_gb'))
+        process_limit = int(st.number_input('Process working-set stop limit (GiB)', min_value=1, value=14, key='process_memory_limit_gb'))
+        available_floor = int(st.number_input('Available system memory floor (GiB)', min_value=1, value=4, key='available_memory_floor_gb'))
         st.caption('The DuckDB limit is not a whole-process limit. Resource stops retain diagnostics and never publish a partial result.')
     with st.expander('CDR matching profiles'):
         st.text_area('Keys by SERVICE_TYPE (JSON)', value=json.dumps(MATCH_PROFILES, indent=2), height=240, key='matching_profiles')
@@ -460,16 +464,24 @@ else:
                     else:
                         st.info('This report exceeds 25 MB. Open the generated file at the local path above.')
         elif meta['status'] != 'COMPLETED':
-            st.error(f"Run status: {meta['status']}. Reconciliation is blocked until all input issues are corrected.")
+            validation_failed = meta['status'] == 'VALIDATION_FAILED'
+            st.error(f"Run status: {meta['status']}. " + (
+                'Reconciliation is blocked until all input issues are corrected.' if validation_failed else
+                'Processing stopped before reconciliation completed.'))
             if meta.get('error'):
                 st.error(meta['error'])
+            stop_reason = meta.get('stop_reason') or meta.get('resource_summary', {}).get('stop_reason')
+            if stop_reason:
+                st.info('Stop reason: ' + stop_reason)
             for source, requirement in meta.get('decimal_requirements', {}).items():
                 if requirement['observed_fractional_digits'] > requirement['configured_scale']:
                     st.info(f"{source}: values require {requirement['observed_fractional_digits']} fractional digits; the selected scale is {requirement['configured_scale']}. Select sufficient precision in Processing settings and create a new run. No amounts were rounded.")
             st.metric('Validation issues', meta.get('issue_count', 0))
             st.dataframe(meta['files'], hide_index=True, width='stretch')
             table(run, 'issues', 'invalid')
-            st.info('Export the Data Ingestion Validation report from Export Reports, correct the source files, and create a new run.')
+            st.info('Export the Data Ingestion Validation report from Export Reports, correct the source files, and create a new run.'
+                    if validation_failed else
+                    'Review the saved error and resource diagnostics, then create a new run. An interrupted read does not establish that the CSV is invalid.')
         elif page == 'Executive Summary':
             st.header('Executive Summary')
             if meta['result'] == 'MATCH':
