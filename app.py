@@ -16,7 +16,7 @@ import streamlit as st
 from core.engine import Run
 from core.ingestion import inspect_headers, validate_header_mapping
 from core.reporting import REPORTS, DETAIL_TABLES, export_report, export_detail, export_all_records_xlsx
-from core.schema import FIELDS, InputOptions, Settings, MATCH_PROFILES, canonical, resolve_inputs
+from core.schema import DATE_FORMATS, FIELDS, InputOptions, Settings, MATCH_PROFILES, canonical, resolve_inputs
 from core.workflow import execute
 from core.summary_revenue import (SUMMARY_FIELDS, SummaryInputOptions, execute_summary,
                                   export_summary_xlsx, inspect_summary_headers,
@@ -193,7 +193,7 @@ def source_input(source, label, summary_mode=False):
         delimiter = st.selectbox('CSV delimiter', [',', ';', '\t', '|'], key=source + '_delimiter', format_func=lambda value: 'Tab' if value == '\t' else value)
         encoding = st.text_input('CSV encoding', 'utf-8-sig', key=source + '_encoding')
         decimal = st.selectbox('Decimal separator', ['.', ','], key=source + '_decimal')
-        date_format = st.selectbox('EVENT_DATE format', ['%m/%d/%Y', '%Y-%m-%d', '%Y%m%d', '%d/%m/%Y'], key=source + '_date_format', disabled=summary_mode)
+        date_format = st.selectbox('EVENT_DATE format', DATE_FORMATS, key=source + '_date_format', disabled=summary_mode)
         sheet = st.text_input('XLSX worksheet (required for multiple sheets)', key=source + '_sheet')
     with st.expander('Column mapping'):
         st.caption('Automatic mapping accepts canonical names, case/separator variants, and underscore-less aliases. Inspect headers to map other names.')

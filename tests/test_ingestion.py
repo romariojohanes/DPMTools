@@ -97,6 +97,32 @@ def test_explicit_date_and_traffic_constraint(run_pair):
     assert all(r['code'] == 'TRAFFIC_DATE_MISMATCH' for r in bad.rows('SELECT * FROM issues'))
 
 
+def test_two_digit_year_and_independent_source_formats(run_pair):
+    run = run_pair(
+        legacy=[cdr(EVENT_DATE='11/07/26')],
+        saas=[cdr(EVENT_DATE='2026-11-07')],
+        legacy_options=InputOptions(date_format='%m/%d/%y'),
+        saas_options=InputOptions(date_format='%Y-%m-%d'),
+    )
+    assert run.meta['result'] == 'MATCH', run.meta
+    assert str(run.rows('SELECT EVENT_DATE FROM legacy')[0]['EVENT_DATE']) == '2026-11-07'
+    assert str(run.rows('SELECT EVENT_DATE FROM saas')[0]['EVENT_DATE']) == '2026-11-07'
+
+
+@pytest.mark.parametrize(
+    'value',
+    ['02/29/26', '13/07/26', '11/31/26', '11/07/2026'],
+    ids=['non-leap-day', 'invalid-month', 'invalid-day', 'four-digit-year'],
+)
+def test_invalid_two_digit_year_dates(run_pair, value):
+    run = run_pair(
+        legacy=[cdr(EVENT_DATE=value)],
+        legacy_options=InputOptions(date_format='%m/%d/%y'),
+    )
+    assert run.meta['status'] == 'VALIDATION_FAILED', run.meta
+    assert run.rows("SELECT * FROM issues WHERE field='EVENT_DATE' AND code='INVALID_DATE'")
+
+
 def test_unsafe_excel_identifiers_and_formulas(run_pair):
     row = cdr(IMSI=123456789012345, RATED_AMOUNT_TAP='=1+1')
     run = run_pair(saas=[row], xlsx=True)

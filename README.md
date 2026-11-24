@@ -82,7 +82,7 @@ BNUM
 
 | Fields | Policy |
 |---|---|
-| EVENT_DATE | DATE, using selected `%Y-%m-%d`, `%Y%m%d`, `%d/%m/%Y`, or `%m/%d/%Y`; exact format round-trip required |
+| EVENT_DATE | DATE, using selected `%Y-%m-%d`, `%Y%m%d`, `%d/%m/%Y`, `%m/%d/%Y`, or `%m/%d/%y`; exact format round-trip required |
 | EVENT_BEGIN_TIME, EVENT_END_TIME | Recognized HHMMSS, native integral times, and H:MM:SS normalize to HH:MM:SS; other strings are retained. No duration derivation |
 | IMSI, ANUM, BNUM, GPRS_CHARGING_ID | Strings; text leading zeros retained. Nonnegative integral Excel numeric cells with at most 15 digits are accepted exactly; unsafe numeric cells block validation |
 | HPMN, VPMN | Trimmed, uppercase strings; required |

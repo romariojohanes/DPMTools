@@ -32,6 +32,8 @@ def test_initial_app_renders(tmp_path, monkeypatch):
     assert not app.exception
     assert app.title[0].value == 'DPM+ Roaming Reconciliation Tool'
     assert any(button.label == 'Start reconciliation' for button in app.button)
+    assert '%m/%d/%y' in app.selectbox(key='legacy_date_format').options
+    assert '%m/%d/%y' in app.selectbox(key='saas_date_format').options
 
 
 def test_successful_run_and_all_pages(tmp_path, monkeypatch):

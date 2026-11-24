@@ -24,6 +24,7 @@ MATCH_PROFILES = {
 COMPARISON_FIELDS = ['RATED_AMOUNT_TAP', 'CURRENCY', 'RATE', 'VOLUME_INCOMING', 'VOLUME_OUTGOING',
                      'VOLUME_TOTAL', 'VOLUME_CHARGED_UNITS', 'DURATION_TOTAL', 'TAX_AMOUNT_TAP', 'FINAL_TAX_AMOUNT']
 NULLS = ['', 'NULL', 'NONE', 'N/A', 'NA', '\\N']
+DATE_FORMATS = ('%m/%d/%Y', '%m/%d/%y', '%Y-%m-%d', '%Y%m%d', '%d/%m/%Y')
 
 
 def canonical(value: str) -> str:
@@ -49,7 +50,7 @@ class InputOptions:
             raise ValueError('CSV delimiter must be one character, excluding quotes/newlines.')
         if self.decimal_separator not in ('.', ','):
             raise ValueError('Decimal separator must be a dot or comma.')
-        if self.date_format not in ('%Y-%m-%d', '%Y%m%d', '%d/%m/%Y', '%m/%d/%Y'):
+        if self.date_format not in DATE_FORMATS:
             raise ValueError('Select an explicit supported date format.')
         ''.encode(self.encoding)  # fail early for unknown codecs
         if self.column_mapping is not None:
