@@ -76,6 +76,10 @@ def _windows_memory_io():
         'read_bytes': int(io.ReadTransferCount),
         'write_bytes': int(io.WriteTransferCount),
         'available_memory_bytes': int(status.ullAvailPhys),
+        'total_physical_memory_bytes': int(status.ullTotalPhys),
+        # Windows reports the smaller applicable system/process commit limit.
+        'commit_limit_bytes': int(status.ullTotalPageFile),
+        'available_commit_bytes': int(status.ullAvailPageFile),
     }
 
 
@@ -130,7 +134,7 @@ class ResourceMonitor:
             stage=self.run.current_stage,
         )
         progress = self.run.meta.get('progress', {})
-        values.update({key: progress[key] for key in ('source', 'source_file', 'records') if key in progress})
+        values.update({key: progress[key] for key in ('source', 'source_file', 'records', 'memory_limit') if key in progress})
         run_disk = shutil.disk_usage(self.run.directory)
         values['run_disk_free_bytes'] = run_disk.free
         values['disk_free_bytes'] = min(disk.free, run_disk.free)
@@ -218,6 +222,7 @@ class ResourceMonitor:
             self.thread.join(timeout=max(self.settings.monitor_interval_seconds * 2, 2))
         self.samples.append(self._sample())
         numeric = ('working_set_bytes', 'peak_working_set_bytes', 'pagefile_bytes', 'read_bytes',
+                   'total_physical_memory_bytes', 'commit_limit_bytes', 'available_commit_bytes',
                    'write_bytes', 'available_memory_bytes', 'temp_bytes', 'run_bytes', 'disk_free_bytes',
                    'temp_disk_free_bytes', 'run_disk_free_bytes', 'read_bytes_per_second',
                    'write_bytes_per_second', 'cpu_percent')

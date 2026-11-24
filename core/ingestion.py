@@ -124,6 +124,13 @@ def _issue(run, source, path, sheet, row, field, raw, code, message):
                     [source, str(path), sheet, row, field, raw, code, message])
 
 
+def _csv_memory_limit(configured):
+    """Bound CSV-reader caching without raising a smaller configured budget."""
+    value = ''.join(configured.upper().split())
+    ceiling = 1000 if value.endswith('MB') else 1  # DuckDB MB/GB use decimal units.
+    return '1GB' if Decimal(value[:-2]) > ceiling else configured
+
+
 def _csv(run, source, path, options):
     run.emit('csv_provenance', source=source, source_file=str(path))
     row_map = run.directory / 'csv_rows.csv'
@@ -152,6 +159,7 @@ def _csv(run, source, path, options):
                 if ordinal % 100000 == 0:
                     run.emit('csv_provenance', records=ordinal, source_file=str(path), source=source)
     converted = None
+    restore_memory = False
     try:
         # DuckDB core handles UTF-8; other configured codecs are transcoded in bounded chunks.
         scan = path
@@ -163,21 +171,29 @@ def _csv(run, source, path, options):
                     dst.write(block)
             scan = converted
         cols = '{' + ','.join(f'{quote(name)}: \'VARCHAR\'' for name in headers) + '}'
-        projection = ','.join('"' + f + '"' for f in FIELDS)
+        scan_memory = _csv_memory_limit(run.settings.memory_limit)
+        if scan_memory != run.settings.memory_limit:
+            restore_memory = True
+            # Consumed CSV buffers are cached until eviction or query end. A
+            # large general query budget otherwise permits whole-file caching.
+            run.con.execute(f'SET memory_limit={quote(scan_memory)}')
         # Stream two ordered CSV readers together. A full-file temporary copy and
         # a hash table of every provenance ordinal are unnecessary for this zip.
-        # Explicit columns still prevent type inference/identifier corruption.
-        run.emit('csv_scan', source=source, source_file=str(path))
+        # Keep both inputs as direct scans so DuckDB can use POSITIONAL_SCAN.
+        # A projected constant marker forces the buffering POSITIONAL_JOIN path.
+        # The virtual filename marks even an all-NULL CSV record as present; its
+        # leading underscores cannot collide with our canonical input headers.
+        run.emit('csv_scan', source=source, source_file=str(path), memory_limit=scan_memory)
         target_columns = ','.join('"' + f + '"' for f in FIELDS + ['source_file', 'source_sheet', 'source_row'])
         sql = f'''INSERT INTO raw_{source} ({target_columns})
             SELECT {','.join('s."' + f + '"' for f in FIELDS)}, {quote(str(path))}, '',
-                   CASE WHEN s.__dpm_record_present IS NULL OR p.source_row IS NULL
+                   CASE WHEN s.__dpm_csv_file IS NULL OR p.source_row IS NULL
                         THEN error('CSV reader/provenance row counts disagree; no rows accepted.')
                         ELSE p.source_row END
-            FROM (SELECT {projection}, true AS __dpm_record_present
-                  FROM read_csv({quote(str(scan))}, columns={cols}, header=true, auto_detect=false,
-                      delim={quote(options.delimiter)}, quote='"', escape='"', parallel=false,
-                      strict_mode=true, ignore_errors=false, null_padding=false, nullstr='')) s
+            FROM read_csv({quote(str(scan))}, columns={cols}, header=true, auto_detect=false,
+                delim={quote(options.delimiter)}, quote='"', escape='"', parallel=false,
+                strict_mode=true, ignore_errors=false, null_padding=false, nullstr='',
+                filename='__dpm_csv_file') s
             POSITIONAL JOIN read_csv({quote(str(row_map))}, header=true, auto_detect=false,
                 parallel=false, columns={{'record_number':'BIGINT','source_row':'BIGINT'}}) p'''
         run.con.execute('BEGIN TRANSACTION')
@@ -190,12 +206,16 @@ def _csv(run, source, path, options):
         except Exception:
             run.con.execute('ROLLBACK')
             raise
-        run.emit('csv_scan', source=source, source_file=str(path), records=count)
+        run.emit('csv_scan', source=source, source_file=str(path), records=count, memory_limit=scan_memory)
         return count, ''
     finally:
-        if converted:
-            converted.unlink(missing_ok=True)
-        row_map.unlink(missing_ok=True)
+        try:
+            if restore_memory:
+                run.con.execute(f'SET memory_limit={quote(run.settings.memory_limit)}')
+        finally:
+            if converted:
+                converted.unlink(missing_ok=True)
+            row_map.unlink(missing_ok=True)
 
 
 def _xlsx(run, source, path, options):
@@ -286,6 +306,8 @@ def ingest(run, source, paths, options: InputOptions):
         before = path.stat()
         record = {'source': source, 'filename': path.name, 'path': str(path), 'bytes': before.st_size,
                   'modified_ns': before.st_mtime_ns, 'rows': 0, 'sheet': '', 'status': 'FAILED'}
+        if path.suffix.lower() == '.csv':
+            record['csv_memory_limit'] = _csv_memory_limit(run.settings.memory_limit)
         try:
             record['sha256_before'], before_hash_seconds = _sha256(path, checkpoint=run.checkpoint)
             record['sha256_seconds'] = before_hash_seconds

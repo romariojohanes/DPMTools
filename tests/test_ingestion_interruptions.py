@@ -138,11 +138,13 @@ def test_late_cancel_never_publishes_completed_result(tmp_path):
         assert 'aggregate_result' not in run.meta
 
 
-def test_actual_csv_stage_interrupt_cleans_spools_and_retains_error(tmp_path, monkeypatch):
+@pytest.mark.parametrize('memory', ['256MB', '4GB'])
+def test_actual_csv_stage_interrupt_cleans_spools_and_retains_error(tmp_path, monkeypatch, memory):
     left = write_csv(tmp_path / 'legacy.csv', [cdr()])
     right = write_csv(tmp_path / 'saas.csv', [cdr()])
     create = Run.create
     interrupted = Event()
+    configured_limits, final_limits = [], []
 
     class SlowScan:
         def __init__(self, connection):
@@ -151,12 +153,16 @@ def test_actual_csv_stage_interrupt_cleans_spools_and_retains_error(tmp_path, mo
         def __getattr__(self, name):
             return getattr(self.connection, name)
 
+        def close(self):
+            final_limits.append(self.connection.execute("SELECT current_setting('memory_limit')").fetchone()[0])
+            self.connection.close()
+
         def execute(self, sql, params=None):
             if sql.startswith('INSERT INTO raw_legacy') and 'read_csv(' in sql:
                 # Exercise _csv's real scan/finally path with a deliberately long
                 # synthetic workload, interrupted on this run's connection only.
-                sql = sql.replace('true AS __dpm_record_present',
-                                  '(SELECT sum(i) FROM range(1000000000000) workload(i)) IS NOT NULL AS __dpm_record_present')
+                sql = sql.replace('SELECT s."EVENT_DATE"',
+                                  'SELECT (SELECT CAST(sum(i) AS VARCHAR) FROM range(1000000000000) workload(i))')
                 timer = Timer(0.1, self.connection.interrupt)
                 timer.start()
                 try:
@@ -171,13 +177,15 @@ def test_actual_csv_stage_interrupt_cleans_spools_and_retains_error(tmp_path, mo
 
     def create_run(*args, **kwargs):
         run = create(*args, **kwargs)
+        configured_limits.append(run.con.execute("SELECT current_setting('memory_limit')").fetchone()[0])
         run.con = SlowScan(run.con)
         return run
 
     monkeypatch.setattr(Run, 'create', create_run)
     directory = execute([left], [right], root=tmp_path / 'runs',
-                        settings=Settings(memory_limit='256MB', threads=1))
+                        settings=Settings(memory_limit=memory, threads=1))
     assert interrupted.is_set()
+    assert final_limits == configured_limits
     with Run(directory) as run:
         assert run.meta['status'] == 'FAILED', run.meta
         assert run.meta['error_type'] == 'InterruptException'

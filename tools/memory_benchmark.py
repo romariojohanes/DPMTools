@@ -45,6 +45,28 @@ class ProfileConnection:
         return result
 
 
+class NativeResourceMonitor(ResourceMonitor):
+    """Optional allocation sampling on a separate connection, never the busy worker."""
+
+    def __init__(self, run):
+        super().__init__(run)
+        self.memory_connection = run.con.cursor()
+
+    def _sample_locked(self):
+        sample = super()._sample_locked()
+        sample['duckdb_memory'] = {
+            tag: {'memory_bytes': memory, 'spill_bytes': spill}
+            for tag, memory, spill in self.memory_connection.execute('SELECT * FROM duckdb_memory()').fetchall()
+            if memory or spill}
+        return sample
+
+    def finish(self):
+        try:
+            return super().finish()
+        finally:
+            self.memory_connection.close()
+
+
 def generate(directory, rows):
     path = directory / 'synthetic.csv'
     if path.exists():
@@ -71,6 +93,7 @@ def main():
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--chunk', type=int, default=250_000)
     parser.add_argument('--raw-only', action='store_true', help='Measure CSV ingestion without normalization')
+    parser.add_argument('--native-memory', action='store_true', help='Sample live DuckDB allocation tags on a separate connection')
     args = parser.parse_args()
     directory = Path(args.directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -98,7 +121,7 @@ def main():
     run = Run.create(directory / 'runs', settings)
     profile = ProfileConnection(run.con)
     run.con = profile
-    monitor = ResourceMonitor(run)
+    monitor = NativeResourceMonitor(run) if args.native_memory else ResourceMonitor(run)
     started = perf_counter()
     result = {'label': args.label, 'fixture': fixture, 'settings': vars(settings),
               'duckdb': duckdb.__version__, 'run_directory': str(run.directory),
@@ -138,6 +161,12 @@ def main():
         result['stage_working_set_peak_bytes'] = {
             stage: max(s.get('working_set_bytes', 0) for s in monitor.samples if s['stage'] == stage)
             for stage in {s['stage'] for s in monitor.samples}}
+        if args.native_memory:
+            scans = [sample for sample in monitor.samples if sample['stage'] == 'csv_scan']
+            tags = {tag for sample in scans for tag in sample['duckdb_memory']}
+            result['csv_native_peak_bytes'] = {
+                tag: max(sample['duckdb_memory'].get(tag, {}).get('memory_bytes', 0) for sample in scans)
+                for tag in tags}
         run.meta['status'] = 'BENCHMARK_' + result['status']
         run.save()
         run.close()

@@ -358,7 +358,7 @@ if page == 'New Reconciliation':
         reserve = int(st.number_input('Minimum free disk space (GiB)', min_value=1, value=50, key='free_space_reserve_gb'))
         process_limit = int(st.number_input('Process working-set stop limit (GiB)', min_value=1, value=14, key='process_memory_limit_gb'))
         available_floor = int(st.number_input('Available system memory floor (GiB)', min_value=1, value=4, key='available_memory_floor_gb'))
-        st.caption('The DuckDB limit is not a whole-process limit. Resource stops retain diagnostics and never publish a partial result.')
+        st.caption('CSV scans use at most 1 GB of this budget; later stages use the configured limit. The DuckDB limit is not a whole-process limit. Resource stops retain diagnostics and never publish a partial result.')
     with st.expander('CDR matching profiles'):
         st.text_area('Keys by SERVICE_TYPE (JSON)', value=json.dumps(MATCH_PROFILES, indent=2), height=240, key='matching_profiles')
         st.checkbox('Full audit of all 24 fields', key='full_audit')
