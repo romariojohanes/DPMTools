@@ -64,7 +64,7 @@ def test_streaming_detail_exports_and_filter(run_pair):
 def test_excel_extract_and_worksheet_bounds(run_pair, monkeypatch, tmp_path):
     from openpyxl import Workbook
     import core.reporting as reporting
-    run = run_pair(legacy=[cdr(GPRS_CHARGING_ID=str(i)) for i in range(8)])
+    run = run_pair(legacy=[cdr(GPRS_CHARGING_ID=str(i), VOLUME_CHARGED_UNITS=str(i)) for i in range(8)])
     monkeypatch.setattr(reporting, 'EXCEL_MAX_ROWS', 4)
     workbook = Workbook(write_only=True)
     reporting._query_sheet(workbook, run, 'legacy_only', limit=5)
@@ -184,7 +184,7 @@ def test_all_records_csv_is_semicolon_utf8_exact_and_filtered(run_pair, tmp_path
 
 def test_all_records_xlsx_splits_without_truncation(run_pair, tmp_path, monkeypatch):
     import core.reporting as reporting
-    rows = [cdr(GPRS_CHARGING_ID=f'{i:018d}') for i in range(7)]
+    rows = [cdr(GPRS_CHARGING_ID=f'{i:018d}', VOLUME_CHARGED_UNITS=str(i)) for i in range(7)]
     run = run_pair(legacy=rows, saas=rows)
     monkeypatch.setattr(reporting, 'EXCEL_MAX_ROWS', 4)
     target, count, _ = reporting.export_all_records_xlsx(run, tmp_path)

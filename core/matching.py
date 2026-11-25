@@ -1,6 +1,8 @@
 """Disk-backed composite-key matching. Duplicate groups are never paired."""
 from core.schema import FIELDS, NUMERIC, COMPARISON_FIELDS, MATCH_PROFILES, quote
 
+APPROVED_NUMERIC_KEY_FIELDS = {'VOLUME_CHARGED_UNITS'}
+
 
 def validate_profiles(profiles):
     if not isinstance(profiles, dict) or not profiles:
@@ -10,8 +12,9 @@ def validate_profiles(profiles):
             raise ValueError('Matching profile names must be uppercase SERVICE_TYPE values.')
         if not isinstance(keys, list) or not keys or len(set(keys)) != len(keys):
             raise ValueError('Each matching profile needs distinct key fields.')
-        if any(key not in FIELDS or key in NUMERIC or key == 'CURRENCY' or key in ('RATE_UNIT', 'ROUNDED_UNIT_ID') for key in keys):
-            raise ValueError('Matching keys must use known non-rating fields.')
+        if any(key not in FIELDS or (key in NUMERIC and key not in APPROVED_NUMERIC_KEY_FIELDS)
+               or key == 'CURRENCY' or key in ('RATE_UNIT', 'ROUNDED_UNIT_ID') for key in keys):
+            raise ValueError('Matching keys must use known non-rating fields; VOLUME_CHARGED_UNITS is the only approved numeric key field.')
     return profiles
 
 

@@ -21,10 +21,20 @@ EPSILON = Decimal('0.000000000000000000000001')
 SAME = 'MATCHED_SAME_RATING'
 DIFFERENT = 'MATCHED_DIFFERENT_RATING'
 AMBIGUOUS = 'DUPLICATE_OR_AMBIGUOUS'
+SPECIAL_VOLUMES = {
+    'RATING_CHANGE': 1_000_001, 'RATE_CHANGE': 1_000_002, 'FORMAT_ONLY': 1_000_003,
+    'FIELD_CHANGE': 1_000_004, 'CURRENCY_CHANGE': 1_000_005, 'LEFT_ONLY': 1_000_006,
+    'RIGHT_ONLY': 1_000_007, 'DUP_LEFT': 1_000_008, 'DUP_RIGHT': 1_000_009,
+    'DUP_BOTH': 1_000_010, 'DUP_LEFT_ONLY': 1_000_011, 'DUP_RIGHT_ONLY': 1_000_012,
+    'INCOMPLETE': 1_000_013, 'UNSUPPORTED': 1_000_014,
+    'KEY_IMSI_A': 1_000_015, 'KEY_IMSI_B': 1_000_015,
+}
 
 
 def _row(source, label, amount=AMOUNT, **overrides):
+    volume = int(label.removeprefix('CDR_')) + 1 if label.startswith('CDR_') else SPECIAL_VOLUMES[label]
     return cdr(IMSI='000000000000001', GPRS_CHARGING_ID=label,
+               VOLUME_CHARGED_UNITS=str(volume),
                EVENT_BEGIN_TIME='080000' if source == 'legacy' else '08:00:00',
                EVENT_END_TIME='080030' if source == 'legacy' else '08:00:30',
                RATED_AMOUNT_TAP=amount, RATE=str(EPSILON), **overrides)
@@ -102,23 +112,31 @@ def _assert_global_oracle(run, common, expected):
     run.con.execute('CREATE TEMP TABLE expected_groups (label VARCHAR, status VARCHAR, legacy_count BIGINT, saas_count BIGINT)')
     run.con.execute("INSERT INTO expected_groups SELECT printf('CDR_%07d',i), ?,1,1 FROM range(?) t(i)", [SAME, common])
     run.con.executemany('INSERT INTO expected_groups VALUES (?,?,?,?)', expected)
-    # The fixture has two distinct IMSIs sharing one charging ID. All other
+    # The fixture has two distinct IMSIs sharing one charged volume. All other
     # controlled key fields are equal after normalization, except missing IMSI.
-    run.con.execute('''CREATE TEMP VIEW actual_groups AS
+    run.con.execute(f'''CREATE TEMP VIEW actual_groups AS
         SELECT *, CASE WHEN profile<>'GPRS' THEN 'UNSUPPORTED'
-            WHEN json_extract_string(substr(match_key,6),'$[6]')='SAME_CHARGING_ID'
+            WHEN CAST(json_extract_string(substr(match_key,6),'$[6]') AS DECIMAL(38,24))=1000015
                 THEN CASE json_extract_string(substr(match_key,6),'$[0]')
                     WHEN '000000000000001' THEN 'KEY_IMSI_A'
                     WHEN '000000000000002' THEN 'KEY_IMSI_B' END
-            ELSE json_extract_string(substr(match_key,6),'$[6]') END AS label
-        FROM cdr_matches''')
+            WHEN CAST(json_extract_string(substr(match_key,6),'$[6]') AS DECIMAL(38,24)) <= {common}
+                THEN printf('CDR_%07d', CAST(json_extract_string(substr(match_key,6),'$[6]') AS BIGINT)-1)
+            ELSE CASE CAST(json_extract_string(substr(match_key,6),'$[6]') AS BIGINT)
+                WHEN 1000001 THEN 'RATING_CHANGE' WHEN 1000002 THEN 'RATE_CHANGE'
+                WHEN 1000003 THEN 'FORMAT_ONLY' WHEN 1000004 THEN 'FIELD_CHANGE'
+                WHEN 1000005 THEN 'CURRENCY_CHANGE' WHEN 1000006 THEN 'LEFT_ONLY'
+                WHEN 1000007 THEN 'RIGHT_ONLY' WHEN 1000008 THEN 'DUP_LEFT'
+                WHEN 1000009 THEN 'DUP_RIGHT' WHEN 1000010 THEN 'DUP_BOTH'
+                WHEN 1000011 THEN 'DUP_LEFT_ONLY' WHEN 1000012 THEN 'DUP_RIGHT_ONLY'
+                WHEN 1000013 THEN 'INCOMPLETE' WHEN 1000014 THEN 'UNSUPPORTED' END END AS label
+            FROM cdr_matches''')
     assert run.con.execute('''SELECT count(*) FROM actual_groups a FULL OUTER JOIN expected_groups e USING(label)
         WHERE a.label IS NULL OR e.label IS NULL OR a.status IS DISTINCT FROM e.status
            OR a.legacy_count IS DISTINCT FROM e.legacy_count OR a.saas_count IS DISTINCT FROM e.saas_count''').fetchone()[0] == 0
     assert run.con.execute('SELECT count(*),count(DISTINCT label) FROM actual_groups').fetchone() == (common + len(expected),) * 2
     assert not run.con.execute('''SELECT 1 FROM cdr_matches m JOIN legacy l ON m.legacy_id=l.record_id
-        JOIN saas s ON m.saas_id=s.record_id WHERE l.GPRS_CHARGING_ID IS DISTINCT FROM s.GPRS_CHARGING_ID
-        OR l.IMSI IS DISTINCT FROM s.IMSI LIMIT 1''').fetchall()
+        JOIN saas s ON m.saas_id=s.record_id WHERE l.IMSI IS DISTINCT FROM s.IMSI LIMIT 1''').fetchall()
 
     counts = {}
     for index, source in enumerate(('legacy', 'saas'), start=2):
@@ -231,8 +249,10 @@ def test_default_250k_chunks_match_sparse_record_ids_in_chunk_1_and_30(tmp_path,
         normalize(run, source, options)
 
     monkeypatch.setattr(ingestion, 'normalize', place_in_distant_chunk)
-    left = write_csv(tmp_path / 'legacy.csv', [cdr(GPRS_CHARGING_ID='ANCHOR'), cdr(GPRS_CHARGING_ID='LEFT')])
-    right = write_csv(tmp_path / 'saas.csv', [cdr(GPRS_CHARGING_ID='RIGHT'), cdr(GPRS_CHARGING_ID='ANCHOR')])
+    left = write_csv(tmp_path / 'legacy.csv', [cdr(GPRS_CHARGING_ID='ANCHOR', VOLUME_CHARGED_UNITS='1'),
+                                               cdr(GPRS_CHARGING_ID='LEFT', VOLUME_CHARGED_UNITS='2')])
+    right = write_csv(tmp_path / 'saas.csv', [cdr(GPRS_CHARGING_ID='RIGHT', VOLUME_CHARGED_UNITS='3'),
+                                              cdr(GPRS_CHARGING_ID='ANCHOR', VOLUME_CHARGED_UNITS='1')])
     directory = execute([left], [right], root=tmp_path / 'runs',
                         settings=Settings(memory_limit='256MB', threads=2, decimal_scale=24))
     with Run(directory) as run:

@@ -88,7 +88,9 @@ def test_shared_string_cache_has_fixed_bound(tmp_path):
 def test_large_generator_pipeline_has_bounded_python_memory(tmp_path):
     tracemalloc.start()
     try:
-        paths = [write_csv(tmp_path / f'{side}.csv', (cdr(GPRS_CHARGING_ID=str(i)) for i in range(20000))) for side in ('left', 'right')]
+        paths = [write_csv(tmp_path / f'{side}.csv',
+                           (cdr(GPRS_CHARGING_ID=str(i), VOLUME_CHARGED_UNITS=str(i)) for i in range(20000)))
+                 for side in ('left', 'right')]
         with Run(execute([paths[0]], [paths[1]], root=tmp_path / 'runs',
                          settings=Settings(memory_limit='256MB', threads=2, normalization_chunk_rows=10_000))) as run:
             assert run.meta['status'] == 'COMPLETED', run.meta
@@ -127,7 +129,7 @@ def test_consolidated_normalization_preserves_independent_transforms(run_pair):
 
 
 def test_stale_xlsx_dimensions_do_not_hide_records(tmp_path):
-    rows = [cdr(GPRS_CHARGING_ID=str(i)) for i in range(3)]
+    rows = [cdr(GPRS_CHARGING_ID=str(i), VOLUME_CHARGED_UNITS=str(i)) for i in range(3)]
     original = write_xlsx(tmp_path / 'original.xlsx', rows)
     right = tmp_path / 'stale.xlsx'
     ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
