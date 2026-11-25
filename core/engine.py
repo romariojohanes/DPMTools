@@ -27,13 +27,21 @@ class Run:
         self.started = perf_counter()
         self.stage_started = self.started
         self.current_stage = None
-        self.con = duckdb.connect(str(self.directory / 'reconciliation.duckdb'))
-        self.con.execute(f'SET memory_limit={quote(self.settings.memory_limit)}')
         temporary = Path(self.settings.temp_directory or self.directory / 'temp').resolve()
         temporary.mkdir(parents=True, exist_ok=True)
         self.temp_directory = temporary
-        self.con.execute(f'SET temp_directory={quote(str(temporary))}')
-        self.con.execute(f'SET max_temp_directory_size={quote(self.settings.max_temp_directory_size)}')
+        # temp_directory is a database-instance setting.  It must be supplied while
+        # DuckDB opens the database: executing SET after connect can try to change an
+        # instance whose temporary storage is already in use by another connection
+        # (for example, the UI while a background export is running).
+        self.con = duckdb.connect(
+            str(self.directory / 'reconciliation.duckdb'),
+            config={
+                'temp_directory': str(temporary),
+                'max_temp_directory_size': self.settings.max_temp_directory_size,
+            },
+        )
+        self.con.execute(f'SET memory_limit={quote(self.settings.memory_limit)}')
         # Investigation/export joins can otherwise allocate a hash buffer per worker.
         self.con.execute(f'SET threads={self.settings.threads if create else 1}')
         self.con.execute(f'SET preserve_insertion_order={"true" if create else "false"}')
