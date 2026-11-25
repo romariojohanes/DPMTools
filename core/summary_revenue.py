@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 
 from core.engine import Run
 from core.monitoring import ResourceMonitor
-from core.schema import canonical, resolve_inputs
+from core.schema import canonical, resolve_inputs, quote
 
 SUMMARY_FIELDS = ('NO', 'PLMN', 'OPERATOR_NAME', 'FIRST_SEQ', 'LAST_SEQ', 'RECORDS',
                   'CHARGE_SDR', 'TAX_SDR', 'TOTAL_CHARGE_SDR', 'SUBSCRIBERS')
@@ -314,7 +314,21 @@ def execute_summary(legacy_paths, saas_paths, *, legacy_options=None, saas_optio
     return run.directory
 
 
-def export_summary_xlsx(run, destination=None, checkpoint=None):
+def _summary_filtered_query(run, filters=None):
+    columns = [row[0] for row in run.con.execute('DESCRIBE summary_comparison').fetchall()]
+    conditions, parameters = [], []
+    for field, value in (filters or {}).items():
+        if field not in columns:
+            raise ValueError('Unknown filter column.')
+        if value in ('', None):
+            continue
+        conditions.append(f'"{field}" = ?')
+        parameters.append(value)
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    return 'SELECT * FROM summary_comparison' + where, parameters
+
+
+def export_summary_xlsx(run, destination=None, checkpoint=None, filters=None):
     if run.meta.get('reconciliation_type') != 'SUMMARY_REVENUE' or run.meta.get('status') != 'COMPLETED':
         raise ValueError('Summary export requires a completed Summary Revenue run.')
     folder = Path(destination or run.directory / 'reports'); folder.mkdir(parents=True, exist_ok=True)
@@ -332,14 +346,24 @@ def export_summary_xlsx(run, destination=None, checkpoint=None):
     counts=run.meta['operator_counts']; summary.append(['overall_status',run.meta['result'],'','',''])
     summary.append(['operator_count',str(counts['legacy']),str(counts['saas']),str(counts['saas']-counts['legacy']),''])
     for row in run.con.execute('SELECT * FROM summary_totals').fetchall(): summary.append(list(row))
-    cursor=run.con.execute('SELECT * FROM summary_comparison ORDER BY PLMN'); headers=[c[0] for c in cursor.description]
+    query, parameters = _summary_filtered_query(run, filters)
+    cursor=run.con.execute(query + ' ORDER BY PLMN', parameters); headers=[c[0] for c in cursor.description]
     detail=sheet('PLMN Comparison',headers); written=0
     while rows:=cursor.fetchmany(2000):
-        for row in rows: detail.append(list(row)); written+=1
+        for row in rows:
+            if written and written % 1_048_575 == 0:
+                detail=sheet(f'PLMN Comparison {written // 1_048_575 + 1}',headers)
+            detail.append(list(row)); written+=1
     for title,status in (('Legacy Only','LEGACY_ONLY'),('SaaS Only','SAAS_ONLY')):
-        cursor=run.con.execute('SELECT * FROM summary_comparison WHERE status=? ORDER BY PLMN',[status]); headers=[c[0] for c in cursor.description]
+        subset = f'SELECT * FROM ({query}) selected WHERE status=? ORDER BY PLMN'
+        cursor=run.con.execute(subset, parameters + [status]); headers=[c[0] for c in cursor.description]
         ws=sheet(title,headers)
-        for row in cursor.fetchall(): ws.append(list(row))
+        subset_written = 0
+        while rows := cursor.fetchmany(2000):
+            for row in rows:
+                if subset_written and subset_written % 1_048_575 == 0:
+                    ws=sheet(f'{title} {subset_written // 1_048_575 + 1}',headers)
+                ws.append(list(row)); subset_written += 1
     issues = sheet('Validation Warnings', ['source','source_file','source_sheet','source_row','field','raw_value','code','message'])
     for row in run.con.execute('SELECT * FROM issues ORDER BY source,source_file,source_row,field').fetchall():
         issues.append(list(row))
@@ -348,7 +372,8 @@ def export_summary_xlsx(run, destination=None, checkpoint=None):
         workbook.save(temporary)
         check=load_workbook(temporary,read_only=True,data_only=False)
         try:
-            verified=max(sum(1 for _ in check['PLMN Comparison'].iter_rows())-1,0)
+            verified=sum(max(sum(1 for _ in ws.iter_rows())-1,0)
+                         for ws in check.worksheets if ws.title.startswith('PLMN Comparison'))
         finally:
             check.close()
         if verified != written: raise ValueError(f'XLSX row count mismatch: expected {written}, found {verified}.')
@@ -357,3 +382,33 @@ def export_summary_xlsx(run, destination=None, checkpoint=None):
         temporary.unlink(missing_ok=True); raise
     digest=_sha256(target)
     return target,written,digest
+
+
+def export_summary_csv(run, destination=None, checkpoint=None, filters=None):
+    if run.meta.get('reconciliation_type') != 'SUMMARY_REVENUE' or run.meta.get('status') != 'COMPLETED':
+        raise ValueError('Summary export requires a completed Summary Revenue run.')
+    folder = Path(destination or run.directory / 'reports'); folder.mkdir(parents=True, exist_ok=True)
+    target, temporary = folder / 'Summary_Revenue_All_Records.csv', folder / 'Summary_Revenue_All_Records.tmp.csv'
+    query, parameters = _summary_filtered_query(run, filters)
+    expected = run.con.execute(f'SELECT count(*) FROM ({query}) selected', parameters).fetchone()[0]
+    try:
+        run.con.execute(f"COPY ({query} ORDER BY PLMN) TO {quote(str(temporary))} "
+                        "(FORMAT CSV, HEADER TRUE, DELIMITER ';')", parameters)
+        with temporary.open('r', encoding='utf-8', newline='') as handle:
+            reader = csv.reader(handle, delimiter=';')
+            next(reader, None)
+            actual = sum(1 for _ in reader)
+        if actual != expected:
+            raise ValueError(f'CSV row count mismatch: expected {expected}, found {actual}.')
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True); raise
+    return target, actual, _sha256(target)
+
+
+def export_summary(run, format='csv', destination=None, checkpoint=None, filters=None):
+    if format == 'csv':
+        return export_summary_csv(run, destination, checkpoint, filters)
+    if format == 'xlsx':
+        return export_summary_xlsx(run, destination, checkpoint, filters)
+    raise ValueError('Summary export format must be csv or xlsx.')

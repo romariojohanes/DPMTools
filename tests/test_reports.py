@@ -4,7 +4,8 @@ from openpyxl import load_workbook
 import pytest
 
 from core.engine import Run
-from core.reporting import REPORTS, export_report, export_detail, export_all_records_xlsx
+from core.reporting import (REPORTS, export_report, export_detail, export_all_records,
+                            export_all_records_xlsx)
 from tools.generate_samples import cdr
 
 
@@ -161,3 +162,49 @@ def test_all_records_xlsx_exports_1182_with_provenance_and_integrity(run_pair, t
             assert str(cell.value).startswith('0') if field != 'match_key' else cell.value.startswith('GPRS:')
     finally:
         workbook.close()
+
+
+def test_all_records_csv_is_semicolon_utf8_exact_and_filtered(run_pair, tmp_path):
+    rows = [cdr(IMSI='0000123456789012345', GPRS_CHARGING_ID='000000000000000001',
+                ANUM='00123', BNUM='00456', RATED_AMOUNT_TAP='0.000000000001'),
+            cdr(HPMN='TST02', IMSI='0000999', GPRS_CHARGING_ID='000000000000000002',
+                RATED_AMOUNT_TAP='12345678901234567890.123456789012')]
+    run = run_pair(legacy=rows, saas=rows)
+    target, count, digest = export_all_records(run, 'csv', tmp_path, filters={'HPMN': 'TST01'})
+    raw = target.read_text(encoding='utf-8')
+    assert count == 1
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert target.name == 'CDR_Matching_Details_All_Records.csv'
+    assert ';' in raw.splitlines()[0]
+    assert '0000123456789012345' in raw
+    assert '000000000000000001' in raw
+    assert '0.000000000001' in raw
+    assert 'e-' not in raw.lower() and 'e+' not in raw.lower()
+
+
+def test_all_records_xlsx_splits_without_truncation(run_pair, tmp_path, monkeypatch):
+    import core.reporting as reporting
+    rows = [cdr(GPRS_CHARGING_ID=f'{i:018d}') for i in range(7)]
+    run = run_pair(legacy=rows, saas=rows)
+    monkeypatch.setattr(reporting, 'EXCEL_MAX_ROWS', 4)
+    target, count, _ = reporting.export_all_records_xlsx(run, tmp_path)
+    workbook = load_workbook(target, read_only=True)
+    try:
+        assert count == 7
+        assert len(workbook.sheetnames) == 3
+        assert sum(max(sum(1 for _ in sheet.iter_rows()) - 1, 0) for sheet in workbook) == 7
+    finally:
+        workbook.close()
+
+
+def test_interrupted_all_records_export_does_not_publish_partial(run_pair, tmp_path):
+    run = run_pair(legacy=[cdr(GPRS_CHARGING_ID=str(i)) for i in range(3)])
+
+    def interrupt(event):
+        if event['event'] == 'all_records_batch':
+            raise InterruptedError('cancelled export')
+
+    with pytest.raises(InterruptedError, match='cancelled export'):
+        export_all_records_xlsx(run, tmp_path, checkpoint=interrupt)
+    assert not (tmp_path / 'CDR_Matching_Details_All_Records.xlsx').exists()
+    assert not (tmp_path / 'CDR_Matching_Details_All_Records.tmp.xlsx').exists()

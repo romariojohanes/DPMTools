@@ -5,7 +5,7 @@ from openpyxl import load_workbook
 
 from core.engine import Run
 from core.schema import Settings
-from core.summary_revenue import SummaryInputOptions, execute_summary, export_summary_xlsx
+from core.summary_revenue import SummaryInputOptions, execute_summary, export_summary, export_summary_xlsx
 
 
 FIELDS = ['NO','PLMN','OPERATOR_NAME','FIRST_SEQ','LAST_SEQ','RECORDS','CHARGE_SDR','TAX_SDR','TOTAL_CHARGE_SDR','SUBSCRIBERS']
@@ -95,6 +95,17 @@ def test_complete_excel_export(tmp_path):
         headers=[c.value for c in next(workbook['PLMN Comparison'].iter_rows())]
         assert {'legacy_charge_sdr','saas_charge_sdr','charge_sdr_difference','legacy_file','saas_file'} <= set(headers)
         workbook.close()
+
+
+def test_complete_summary_csv_export_is_filtered_semicolon_and_verified(tmp_path):
+    with run_summary(tmp_path,[record('0001'),record('0002')],[record('0001'),record('0003')]) as run:
+        path, rows, digest = export_summary(run, 'csv', tmp_path/'exports', filters={'status':'MATCH'})
+        raw = path.read_text(encoding='utf-8')
+        assert rows == 1
+        assert len(digest) == 64
+        assert path.suffix == '.csv'
+        assert ';' in raw.splitlines()[0]
+        assert '0001' in raw
 
 
 def test_subscribers_column_is_optional(tmp_path):

@@ -1,4 +1,5 @@
 """Streaming Excel output; financial decimals are exact text, never Excel floats."""
+import csv
 import hashlib
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +31,17 @@ EXCEL_MAX_ROWS = 1_048_576
 EXTRACT_LIMIT = 50_000
 DETAIL_TABLES = {'cdr_details', 'rating_differences', 'legacy_only', 'saas_only', 'duplicate_keys',
                  'ambiguous_records', 'field_differences', 'revenue_attribution', 'issues'}
+
+CDR_ALL_RECORDS_QUERY = '''SELECT d.*,
+    coalesce(l.IMSI,s.IMSI) AS IMSI, coalesce(l.ANUM,s.ANUM) AS ANUM,
+    coalesce(l.BNUM,s.BNUM) AS BNUM,
+    coalesce(l.GPRS_CHARGING_ID,s.GPRS_CHARGING_ID) AS GPRS_CHARGING_ID,
+    l.TAX_AMOUNT_TAP AS legacy_tax_amount, s.TAX_AMOUNT_TAP AS saas_tax_amount,
+    l.FINAL_TAX_AMOUNT AS legacy_final_tax_amount, s.FINAL_TAX_AMOUNT AS saas_final_tax_amount,
+    l.RATE AS legacy_rate, s.RATE AS saas_rate,
+    d.rating_difference AS revenue_variance
+    FROM cdr_details d LEFT JOIN legacy l ON d.legacy_id=l.record_id
+    LEFT JOIN saas s ON d.saas_id=s.record_id'''
 
 
 def _checkpoint(callback, event, **details):
@@ -80,7 +92,21 @@ def _sha256_file(path, block_size=4 * 1024 * 1024):
     return digest.hexdigest()
 
 
-def export_all_records_xlsx(run, destination=None, checkpoint=None):
+def _filtered_query(run, query, filters=None):
+    columns = [row[0] for row in run.con.execute(f'DESCRIBE ({query})').fetchall()]
+    conditions, parameters = [], []
+    for field, value in (filters or {}).items():
+        if field not in columns:
+            raise ValueError('Unknown filter column.')
+        if value in ('', None):
+            continue
+        conditions.append(f'"{field}" = ?')
+        parameters.append(value)
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    return f'SELECT * FROM ({query}) export_data{where}', parameters
+
+
+def export_all_records_xlsx(run, destination=None, checkpoint=None, filters=None):
     """Stream every CDR detail row to XLSX, independently of UI pagination."""
     if run.meta['status'] != 'COMPLETED':
         raise ValueError('Record export requires a completed run.')
@@ -89,16 +115,8 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None):
     target = destination / 'CDR_Matching_Details_All_Records.xlsx'
     temporary = target.with_suffix('.tmp.xlsx')
     workbook = Workbook(write_only=True)
-    cursor = run.con.execute('''SELECT d.*,
-        coalesce(l.IMSI,s.IMSI) AS IMSI, coalesce(l.ANUM,s.ANUM) AS ANUM,
-        coalesce(l.BNUM,s.BNUM) AS BNUM,
-        coalesce(l.GPRS_CHARGING_ID,s.GPRS_CHARGING_ID) AS GPRS_CHARGING_ID,
-        l.TAX_AMOUNT_TAP AS legacy_tax_amount, s.TAX_AMOUNT_TAP AS saas_tax_amount,
-        l.FINAL_TAX_AMOUNT AS legacy_final_tax_amount, s.FINAL_TAX_AMOUNT AS saas_final_tax_amount,
-        l.RATE AS legacy_rate, s.RATE AS saas_rate,
-        d.rating_difference AS revenue_variance
-        FROM cdr_details d LEFT JOIN legacy l ON d.legacy_id=l.record_id
-        LEFT JOIN saas s ON d.saas_id=s.record_id ORDER BY d.match_key''')
+    query, parameters = _filtered_query(run, CDR_ALL_RECORDS_QUERY, filters)
+    cursor = run.con.execute(query + ' ORDER BY match_key', parameters)
     headers = [column[0] for column in cursor.description]
     sheet = _sheet(workbook, 'CDR Matching Details', headers)
     _format_detail_sheet(sheet, headers)
@@ -124,12 +142,52 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None):
             verification.close()
         temporary.replace(target)
     except BaseException:
+        workbook.close()
         temporary.unlink(missing_ok=True)
         raise
     digest = _sha256_file(target)
     _checkpoint(checkpoint, 'all_records_export_complete', target=str(target), rows=written,
                 bytes=target.stat().st_size, sha256=digest)
     return target, written, digest
+
+
+def export_all_records_csv(run, destination=None, checkpoint=None, filters=None):
+    """Stream every selected CDR detail row as UTF-8 semicolon-delimited CSV."""
+    if run.meta['status'] != 'COMPLETED':
+        raise ValueError('Record export requires a completed run.')
+    destination = Path(destination or run.directory / 'reports')
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / 'CDR_Matching_Details_All_Records.csv'
+    temporary = target.with_suffix('.tmp.csv')
+    query, parameters = _filtered_query(run, CDR_ALL_RECORDS_QUERY, filters)
+    expected = run.con.execute(f'SELECT count(*) FROM ({query}) selected', parameters).fetchone()[0]
+    _checkpoint(checkpoint, 'all_records_export_start', target=str(target), format='csv')
+    try:
+        run.con.execute(
+            f"COPY ({query} ORDER BY match_key) TO {quote(str(temporary))} "
+            "(FORMAT CSV, HEADER TRUE, DELIMITER ';')", parameters)
+        with temporary.open('r', encoding='utf-8', newline='') as handle:
+            reader = csv.reader(handle, delimiter=';')
+            next(reader, None)
+            actual = sum(1 for _ in reader)
+        if actual != expected:
+            raise ValueError(f'CSV row count mismatch: expected {expected}, found {actual}.')
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    digest = _sha256_file(target)
+    _checkpoint(checkpoint, 'all_records_export_complete', target=str(target), format='csv', rows=actual,
+                bytes=target.stat().st_size, sha256=digest)
+    return target, actual, digest
+
+
+def export_all_records(run, format='csv', destination=None, checkpoint=None, filters=None):
+    if format == 'csv':
+        return export_all_records_csv(run, destination, checkpoint, filters)
+    if format == 'xlsx':
+        return export_all_records_xlsx(run, destination, checkpoint, filters)
+    raise ValueError('All-records format must be csv or xlsx.')
 
 
 def _query_sheet(workbook, run, table, limit=EXTRACT_LIMIT, checkpoint=None):

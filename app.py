@@ -15,11 +15,11 @@ import streamlit as st
 
 from core.engine import Run
 from core.ingestion import inspect_headers, validate_header_mapping
-from core.reporting import REPORTS, DETAIL_TABLES, export_report, export_detail, export_all_records_xlsx
+from core.reporting import REPORTS, DETAIL_TABLES, export_report, export_detail, export_all_records
 from core.schema import DATE_FORMATS, FIELDS, InputOptions, Settings, MATCH_PROFILES, canonical, resolve_inputs
 from core.workflow import execute
 from core.summary_revenue import (SUMMARY_FIELDS, SummaryInputOptions, execute_summary,
-                                  export_summary_xlsx, inspect_summary_headers,
+                                  export_summary, inspect_summary_headers,
                                   validate_summary_header_mapping)
 
 ROOT = Path(__file__).resolve().parent
@@ -79,14 +79,14 @@ def processing_pool():
     return ThreadPoolExecutor(max_workers=1, thread_name_prefix='dpm-local')
 
 
-def detail_export_worker(directory, table_name, output_format):
+def detail_export_worker(directory, table_name, output_format, filters=None):
     with Run(directory) as export_run:
-        if table_name == 'summary_comparison' and output_format == 'xlsx':
-            path, rows, digest = export_summary_xlsx(export_run)
+        if table_name == 'summary_comparison' and output_format in ('csv', 'xlsx'):
+            path, rows, digest = export_summary(export_run, output_format, filters=filters)
             return {'path': str(path), 'table': table_name, 'format': output_format,
                     'bytes': path.stat().st_size, 'rows': rows, 'sha256': digest}
-        if table_name == 'cdr_details' and output_format == 'xlsx':
-            path, rows, digest = export_all_records_xlsx(export_run)
+        if table_name == 'cdr_details' and output_format in ('csv', 'xlsx'):
+            path, rows, digest = export_all_records(export_run, output_format, filters=filters)
             return {'path': str(path), 'table': table_name, 'format': output_format,
                     'bytes': path.stat().st_size, 'rows': rows, 'sha256': digest}
         path = export_detail(export_run, table_name, output_format)
@@ -94,9 +94,21 @@ def detail_export_worker(directory, table_name, output_format):
                 'bytes': path.stat().st_size}
 
 
-def request_detail_export(directory, table_name, output_format):
+def request_detail_export(directory, table_name, output_format, filters=None):
     st.session_state.pop('detail_export_result', None)
-    st.session_state['detail_export_request'] = (str(directory), table_name, output_format)
+    st.session_state['detail_export_active_format'] = output_format
+    st.session_state['detail_export_request'] = (str(directory), table_name, output_format, filters or {})
+
+
+def active_table_filters(key, fields):
+    filters = {}
+    for field in fields:
+        value = st.session_state.get(f'{key}_{field}', '')
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in ('', None):
+            filters[field] = value.upper() if field in ('HPMN', 'VPMN', 'PLMN') else value
+    return filters
 
 
 if 'detail_export_request' in st.session_state and 'detail_export_future' not in st.session_state:
@@ -325,7 +337,8 @@ if 'detail_export_future' in st.session_state:
                 st.session_state['detail_export_error'] = str(exc)
             st.rerun()
         else:
-            st.info('Complete detail export is running in the background.')
+            selected_format = st.session_state.get('detail_export_active_format', 'selected format').upper()
+            st.info(f'Complete {selected_format} detail export is running in the background.')
     detail_export_monitor()
 
 if page == 'New Reconciliation':
@@ -395,8 +408,14 @@ else:
                     'Summary SaaS Only': 'summary_saas_only'}[page]
             st.header(page)
             if page == 'PLMN Comparison':
+                summary_export_format = st.radio(
+                    'Export format', ['csv', 'xlsx'], horizontal=True, key='summary_all_records_format',
+                    format_func=lambda value: 'CSV (recommended)' if value == 'csv' else 'XLSX')
+                summary_filters = active_table_filters('summary_comparison', ('PLMN', 'status'))
+                st.caption(f'Selected format: {summary_export_format.upper()} · Applies the current PLMN/status filters.')
                 st.button('Export All Records', type='primary', disabled='detail_export_future' in st.session_state,
-                          on_click=request_detail_export, args=(directory, 'summary_comparison', 'xlsx'),
+                          on_click=request_detail_export,
+                          args=(directory, 'summary_comparison', summary_export_format, summary_filters),
                           help='Exports the complete comparison, independent of UI pagination.')
                 detail_result = st.session_state.get('detail_export_result')
                 if detail_result and detail_result.get('table') == 'summary_comparison':
@@ -405,7 +424,7 @@ else:
                         st.caption(f"{detail_result['rows']:,} records · SHA-256 {detail_result['sha256']} · {detail_path}")
                         if detail_path.stat().st_size <= 25 * 1024 * 1024:
                             with detail_path.open('rb') as handle:
-                                st.download_button('Download All Records XLSX', handle, file_name=detail_path.name,
+                                st.download_button('Download All Records ' + detail_result['format'].upper(), handle, file_name=detail_path.name,
                                                    key='summary_all_records_download', on_click='ignore')
                         else:
                             st.info('This export exceeds 25 MB. Open the verified file at the local path above.')
@@ -523,17 +542,24 @@ else:
             table(run, name, name, tuple(c for c in ('HPMN', 'VPMN') if c in columns))
             if page == 'CDR Matching Summary':
                 st.subheader('CDR Matching Details')
+                all_records_format = st.radio(
+                    'Export format', ['csv', 'xlsx'], horizontal=True, key='cdr_all_records_format',
+                    format_func=lambda value: 'CSV (recommended)' if value == 'csv' else 'XLSX')
+                cdr_filters = active_table_filters(
+                    'cdr_details', ('HPMN', 'VPMN', 'CURRENCY', 'status', 'profile', 'match_key'))
+                st.caption(f'Selected format: {all_records_format.upper()} · Applies the current detail filters.')
                 st.button('Export All Records', type='primary', disabled='detail_export_future' in st.session_state,
-                          on_click=request_detail_export, args=(directory, 'cdr_details', 'xlsx'),
-                          help='Streams every record in this run to Excel; the 100-row table pagination does not apply.')
+                          on_click=request_detail_export,
+                          args=(directory, 'cdr_details', all_records_format, cdr_filters),
+                          help='Streams every selected record to disk; the 100-row table pagination does not apply.')
                 detail_result = st.session_state.get('detail_export_result')
-                if detail_result and detail_result.get('format') == 'xlsx':
+                if detail_result and detail_result.get('table') == 'cdr_details':
                     detail_path = Path(detail_result['path'])
                     if detail_path.exists():
                         st.caption(f"{detail_result['rows']:,} records · SHA-256 {detail_result['sha256']} · {detail_path}")
                         if detail_path.stat().st_size <= 25 * 1024 * 1024:
                             with detail_path.open('rb') as handle:
-                                st.download_button('Download All Records XLSX', handle, file_name=detail_path.name,
+                                st.download_button('Download All Records ' + detail_result['format'].upper(), handle, file_name=detail_path.name,
                                                    key='all_records_download', on_click='ignore')
                         else:
                             st.info('This export exceeds 25 MB. Open the verified file at the local path above.')
