@@ -1,4 +1,5 @@
 """Seven aggregate levels. No individual CDR matching or duplicate elimination."""
+from core.variance import percentage_sql
 
 
 def _comparison(run, table, keys):
@@ -14,6 +15,7 @@ def _comparison(run, table, keys):
             coalesce(l.amount,0) AS legacy_amount, coalesce(s.amount,0) AS saas_amount,
             coalesce(s.amount,0)-coalesce(l.amount,0) AS amount_variance,
             abs(coalesce(s.amount,0)-coalesce(l.amount,0)) AS amount_abs_variance,
+            {percentage_sql('coalesce(s.amount,0)-coalesce(l.amount,0)', 'l.amount')} AS revenue_variance_pct,
             CASE WHEN l.cdr_count IS NULL THEN 'SAAS_ONLY' WHEN s.cdr_count IS NULL THEN 'LEGACY_ONLY' ELSE 'BOTH' END AS presence,
             CASE WHEN l.amount=s.amount THEN 'MATCH' ELSE 'MISMATCH' END AS revenue_status,
             CASE WHEN l.cdr_count=s.cdr_count THEN 'MATCH' ELSE 'MISMATCH' END AS count_status,

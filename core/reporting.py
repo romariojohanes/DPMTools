@@ -6,6 +6,7 @@ from pathlib import Path
 from time import perf_counter
 
 from core.schema import quote
+from core.variance import enhanced_query
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
@@ -32,7 +33,9 @@ EXTRACT_LIMIT = 50_000
 DETAIL_TABLES = {'cdr_details', 'rating_differences', 'legacy_only', 'saas_only', 'duplicate_keys',
                  'ambiguous_records', 'field_differences', 'revenue_attribution', 'issues'}
 
-CDR_ALL_RECORDS_QUERY = '''SELECT d.*,
+def cdr_all_records_query(run):
+    details = enhanced_query(run, 'cdr_details')
+    return f'''SELECT d.*,
     coalesce(l.IMSI,s.IMSI) AS IMSI, coalesce(l.ANUM,s.ANUM) AS ANUM,
     coalesce(l.BNUM,s.BNUM) AS BNUM,
     coalesce(l.GPRS_CHARGING_ID,s.GPRS_CHARGING_ID) AS GPRS_CHARGING_ID,
@@ -40,7 +43,7 @@ CDR_ALL_RECORDS_QUERY = '''SELECT d.*,
     l.FINAL_TAX_AMOUNT AS legacy_final_tax_amount, s.FINAL_TAX_AMOUNT AS saas_final_tax_amount,
     l.RATE AS legacy_rate, s.RATE AS saas_rate,
     d.rating_difference AS revenue_variance
-    FROM cdr_details d LEFT JOIN legacy l ON d.legacy_id=l.record_id
+    FROM ({details}) d LEFT JOIN legacy l ON d.legacy_id=l.record_id
     LEFT JOIN saas s ON d.saas_id=s.record_id'''
 
 
@@ -115,8 +118,8 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None, filters=None
     target = destination / 'CDR_Matching_Details_All_Records.xlsx'
     temporary = target.with_suffix('.tmp.xlsx')
     workbook = Workbook(write_only=True)
-    query, parameters = _filtered_query(run, CDR_ALL_RECORDS_QUERY, filters)
-    cursor = run.con.execute(query + ' ORDER BY match_key', parameters)
+    query, parameters = _filtered_query(run, cdr_all_records_query(run), filters)
+    cursor = run.con.execute(query, parameters)
     headers = [column[0] for column in cursor.description]
     sheet = _sheet(workbook, 'CDR Matching Details', headers)
     _format_detail_sheet(sheet, headers)
@@ -159,12 +162,12 @@ def export_all_records_csv(run, destination=None, checkpoint=None, filters=None)
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / 'CDR_Matching_Details_All_Records.csv'
     temporary = target.with_suffix('.tmp.csv')
-    query, parameters = _filtered_query(run, CDR_ALL_RECORDS_QUERY, filters)
+    query, parameters = _filtered_query(run, cdr_all_records_query(run), filters)
     expected = run.con.execute(f'SELECT count(*) FROM ({query}) selected', parameters).fetchone()[0]
     _checkpoint(checkpoint, 'all_records_export_start', target=str(target), format='csv')
     try:
         run.con.execute(
-            f"COPY ({query} ORDER BY match_key) TO {quote(str(temporary))} "
+            f"COPY ({query}) TO {quote(str(temporary))} "
             "(FORMAT CSV, HEADER TRUE, DELIMITER ';')", parameters)
         with temporary.open('r', encoding='utf-8', newline='') as handle:
             reader = csv.reader(handle, delimiter=';')
@@ -193,7 +196,8 @@ def export_all_records(run, format='csv', destination=None, checkpoint=None, fil
 def _query_sheet(workbook, run, table, limit=EXTRACT_LIMIT, checkpoint=None):
     order = ' ORDER BY source,match_key,record_id' if table == 'ambiguous_records' else ''
     _checkpoint(checkpoint, 'table_extract_start', table=table, limit=limit)
-    cursor = run.con.execute(f'SELECT * FROM {table}{order} LIMIT {int(limit)}')  # internal table names only
+    query = enhanced_query(run, table)
+    cursor = run.con.execute(f'SELECT * FROM ({query}) report_data{order} LIMIT {int(limit)}')
     headers = [c[0] for c in cursor.description]
     part, written = 1, 1
     sheet = _sheet(workbook, table, headers)
@@ -276,7 +280,8 @@ def export_detail(run, table, format='csv', destination=None, filters=None, chec
         raise ValueError('Unknown detail table or export format.')
     if run.meta['status'] != 'COMPLETED' and table != 'issues':
         raise ValueError('Detail exports require a completed run.')
-    columns = [row[0] for row in run.con.execute(f'DESCRIBE {table}').fetchall()]
+    query = enhanced_query(run, table)
+    columns = [row[0] for row in run.con.execute(f'DESCRIBE ({query})').fetchall()]
     conditions, parameters = [], []
     for field, value in (filters or {}).items():
         if field not in columns:
@@ -298,7 +303,7 @@ def export_detail(run, table, format='csv', destination=None, filters=None, chec
     previous_threads = run.con.execute("SELECT current_setting('threads')").fetchone()[0]
     run.con.execute('SET threads=1')
     try:
-        run.con.execute(f'COPY (SELECT * FROM {table}{where}) TO {quote(str(temporary))} ({options})', parameters)
+        run.con.execute(f'COPY (SELECT * FROM ({query}) report_data{where}) TO {quote(str(temporary))} ({options})', parameters)
         if format == 'parquet':
             exported_columns = [row[0] for row in run.con.execute(
                 'DESCRIBE SELECT * FROM read_parquet(?)', [str(temporary)]).fetchall()]
@@ -307,7 +312,7 @@ def export_detail(run, table, format='csv', destination=None, filters=None, chec
             exported_rows = run.con.execute(
                 'SELECT count(*) FROM read_parquet(?)', [str(temporary)]).fetchone()[0]
             expected_rows = run.con.execute(
-                f'SELECT count(*) FROM {table}{where}', parameters).fetchone()[0]
+                f'SELECT count(*) FROM ({query}) report_data{where}', parameters).fetchone()[0]
             if exported_rows != expected_rows:
                 raise ValueError(f'{table} Parquet export row count mismatch: expected {expected_rows}, found {exported_rows}.')
     except Exception:

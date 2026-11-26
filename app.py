@@ -37,7 +37,9 @@ st.caption('CSG Roaming Legacy (On-Premises) ↔ CSG Roaming SaaS · Exact finan
 
 
 def display_rows(rows):
-    return [{key: format(value, 'f') if isinstance(value, Decimal) else value for key, value in row.items()} for row in rows]
+    return [{key: ('N/A' if value is None else format(value, '.4f')) if key.endswith('_variance_pct')
+             else format(value, 'f') if isinstance(value, Decimal) else value
+             for key, value in row.items()} for row in rows]
 
 
 def catalog():
@@ -249,7 +251,8 @@ def source_input(source, label, summary_mode=False):
 
 
 def table(run, name, key, operators=()):
-    columns = [row[0] for row in run.con.execute(f'DESCRIBE {name}').fetchall()]
+    from core.variance import enhanced_query
+    columns = [row[0] for row in run.con.execute(f'DESCRIBE ({enhanced_query(run, name)})').fetchall()]
     filter_columns = list(operators) + (['CURRENCY'] if 'CURRENCY' in columns else []) + (['status'] if 'status' in columns else [])
     filter_columns += [c for c in ('PLMN', 'profile', 'difference_type', 'match_key') if c in columns]
     if name == 'field_differences':

@@ -8,6 +8,7 @@ from time import perf_counter, sleep
 import duckdb
 
 from core.schema import Settings, quote
+from core.variance import enhanced_query
 
 
 class Run:
@@ -127,7 +128,8 @@ class Run:
                    'summary_comparison', 'summary_legacy_only', 'summary_saas_only', 'summary_totals'}
         if table not in allowed:
             raise ValueError('Unknown report table.')
-        columns = [r[0] for r in self.con.execute(f'DESCRIBE {table}').fetchall()]
+        query = enhanced_query(self, table)
+        columns = [r[0] for r in self.con.execute(f'DESCRIBE ({query})').fetchall()]
         clauses, params = [], []
         for key, value in (filters or {}).items():
             if key not in columns:
@@ -143,5 +145,5 @@ class Run:
                                   'HPMN', 'VPMN', 'CURRENCY', 'operator', 'metric', 'status', 'profile') if c in columns and c != sort]
         ordering = ([f'"{sort}" {"DESC" if descending else "ASC"}'] if sort in columns else []) + [f'"{c}"' for c in tie_breaks]
         order = ' ORDER BY ' + ','.join(ordering) if ordering else ''
-        total = self.con.execute(f'SELECT count(*) FROM {table}{where}', params).fetchone()[0]
-        return self.rows(f'SELECT * FROM {table}{where}{order} LIMIT ? OFFSET ?', params + [min(max(limit, 1), 500), max(offset, 0)]), total
+        total = self.con.execute(f'SELECT count(*) FROM ({query}) report_data{where}', params).fetchone()[0]
+        return self.rows(f'SELECT * FROM ({query}) report_data{where}{order} LIMIT ? OFFSET ?', params + [min(max(limit, 1), 500), max(offset, 0)]), total

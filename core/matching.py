@@ -1,5 +1,6 @@
 """Disk-backed composite-key matching. Duplicate groups are never paired."""
 from core.schema import FIELDS, NUMERIC, COMPARISON_FIELDS, MATCH_PROFILES, quote
+from core.variance import percentage_sql
 
 APPROVED_NUMERIC_KEY_FIELDS = {'VOLUME_CHARGED_UNITS'}
 
@@ -65,7 +66,10 @@ def match_cdrs(run, profiles=None, full_audit=False):
         l.source_file AS legacy_file, l.source_sheet AS legacy_sheet, l.source_row AS legacy_row,
         s.source_file AS saas_file, s.source_sheet AS saas_sheet, s.source_row AS saas_row,
         l.RATED_AMOUNT_TAP AS legacy_amount, s.RATED_AMOUNT_TAP AS saas_amount,
-        CASE WHEN l.CURRENCY=s.CURRENCY THEN s.RATED_AMOUNT_TAP-l.RATED_AMOUNT_TAP END AS rating_difference
+        CASE WHEN l.CURRENCY=s.CURRENCY THEN s.RATED_AMOUNT_TAP-l.RATED_AMOUNT_TAP END AS rating_difference,
+        CASE WHEN l.CURRENCY=s.CURRENCY THEN s.RATED_AMOUNT_TAP-l.RATED_AMOUNT_TAP END AS rating_variance_amount,
+        CASE WHEN m.status IN ('MATCHED_SAME_RATING','MATCHED_DIFFERENT_RATING') AND l.CURRENCY=s.CURRENCY
+             THEN ''' + percentage_sql('s.RATED_AMOUNT_TAP-l.RATED_AMOUNT_TAP', 'l.RATED_AMOUNT_TAP') + ''' END AS rating_variance_pct
         FROM cdr_matches m LEFT JOIN legacy l ON m.legacy_id=l.record_id LEFT JOIN saas s ON m.saas_id=s.record_id''')
     for name, status in (('rating_differences', 'MATCHED_DIFFERENT_RATING'), ('legacy_only', 'LEGACY_ONLY'), ('saas_only', 'SAAS_ONLY')):
         run.con.execute(f'CREATE VIEW {name} AS SELECT * FROM cdr_details WHERE status={quote(status)}')

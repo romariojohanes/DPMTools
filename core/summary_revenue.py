@@ -17,6 +17,7 @@ from openpyxl.utils import get_column_letter
 from core.engine import Run
 from core.monitoring import ResourceMonitor
 from core.schema import canonical, resolve_inputs, quote
+from core.variance import enhanced_query
 
 SUMMARY_FIELDS = ('NO', 'PLMN', 'OPERATOR_NAME', 'FIRST_SEQ', 'LAST_SEQ', 'RECORDS',
                   'CHARGE_SDR', 'TAX_SDR', 'TOTAL_CHARGE_SDR', 'SUBSCRIBERS')
@@ -315,7 +316,8 @@ def execute_summary(legacy_paths, saas_paths, *, legacy_options=None, saas_optio
 
 
 def _summary_filtered_query(run, filters=None):
-    columns = [row[0] for row in run.con.execute('DESCRIBE summary_comparison').fetchall()]
+    base = enhanced_query(run, 'summary_comparison')
+    columns = [row[0] for row in run.con.execute(f'DESCRIBE ({base})').fetchall()]
     conditions, parameters = [], []
     for field, value in (filters or {}).items():
         if field not in columns:
@@ -325,7 +327,7 @@ def _summary_filtered_query(run, filters=None):
         conditions.append(f'"{field}" = ?')
         parameters.append(value)
     where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
-    return 'SELECT * FROM summary_comparison' + where, parameters
+    return f'SELECT * FROM ({base}) summary_data' + where, parameters
 
 
 def export_summary_xlsx(run, destination=None, checkpoint=None, filters=None):
