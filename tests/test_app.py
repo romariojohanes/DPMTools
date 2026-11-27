@@ -29,6 +29,78 @@ def finish_detail_export(app):
     return app
 
 
+def finish_filtered_export(app):
+    deadline = monotonic() + 60
+    while 'filtered_export_future' in app.session_state and monotonic() < deadline:
+        sleep(0.1)
+        app.run(timeout=30)
+    assert 'filtered_export_future' not in app.session_state
+    assert 'filtered_export_error' not in app.session_state
+    assert not app.exception
+    return app
+
+
+def test_filtered_excel_download_1111_rows_and_stale_selection(run_pair, tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+    rows = [cdr(HPMN='BELBX', IMSI=f'00101{i:010d}') for i in range(1111)] + [cdr(HPMN='BELBXA')]
+    run = run_pair(legacy=rows, saas=rows)
+    monkeypatch.setenv('DPM_RUN_ROOT', str(tmp_path / 'runs'))
+    app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py')).run(timeout=30)
+    app.sidebar.radio[0].set_value('CDR Matching Summary').run()
+    app.text_input(key='cdr_details_HPMN').set_value(' belbx ').run()
+    app.number_input(key='cdr_details_number').set_value(2).run()
+    assert any('1,111 matching rows' in caption.value for caption in app.caption)
+    assert len(app.dataframe[-1].value) == 100
+    app.button(key='prepare_filtered_records').click().run()
+    finish_filtered_export(app)
+    result = app.session_state['filtered_export_result']
+    assert result['rows'] == 1111 and result['filters']['HPMN'] == 'BELBX'
+    assert Path(result['path']).parent == run.directory / 'reports'
+    assert any(button.label == 'Download Filtered Records (Excel)' for button in app.get('download_button'))
+    workbook = load_workbook(result['path'], read_only=True)
+    try:
+        assert sum(1 for _ in workbook.active.values) == 1112
+    finally:
+        workbook.close()
+    app.number_input(key='cdr_details_number').set_value(3).run()
+    assert any(button.label == 'Download Filtered Records (Excel)' for button in app.get('download_button'))
+    app.text_input(key='cdr_details_VPMN').set_value('NO_MATCH').run()
+    assert not any(button.label == 'Download Filtered Records (Excel)' for button in app.get('download_button'))
+    assert app.button(key='prepare_filtered_records')
+    # The existing export controls and format choices remain available.
+    assert any(button.label == 'Export All Records' for button in app.button)
+    assert app.radio(key='cdr_all_records_format').options == ['CSV (recommended)', 'XLSX']
+
+
+def test_filtered_export_large_file_uses_local_path_and_hides_other_runs(run_pair, tmp_path, monkeypatch):
+    import core.reporting as reporting
+    first = run_pair(legacy=[cdr(HPMN='BELBX')], saas=[cdr(HPMN='BELBX')])
+    second = run_pair(legacy=[cdr(HPMN='BELBX', IMSI='other')], saas=[cdr(HPMN='BELBX', IMSI='other')])
+    monkeypatch.setenv('DPM_RUN_ROOT', str(tmp_path / 'runs'))
+    monkeypatch.setattr(reporting, 'FILTERED_DOWNLOAD_LIMIT_BYTES', 1)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py')).run(timeout=30)
+    app.sidebar.selectbox[0].set_value(first.directory.name).run()
+    app.sidebar.radio[0].set_value('CDR Matching Summary').run()
+    app.button(key='prepare_filtered_records').click().run()
+    finish_filtered_export(app)
+    result = app.session_state['filtered_export_result']
+    assert any('verified local file' in item.value for item in app.info)
+    assert any(item.value == result['path'] for item in app.code)
+    assert not any(button.label == 'Download Filtered Records (Excel)' for button in app.get('download_button'))
+    original_open = Path.open
+
+    def guard_browser_read(path, mode='r', *args, **kwargs):
+        assert not (str(path) == result['path'] and mode == 'rb'), 'Oversized export was read into browser memory'
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', guard_browser_read)
+    app.run()
+    assert not app.exception
+    app.sidebar.selectbox[0].set_value(second.directory.name).run()
+    assert app.button(key='prepare_filtered_records')
+    assert not any(item.value == result['path'] for item in app.code)
+
+
 def test_initial_app_renders(tmp_path, monkeypatch):
     monkeypatch.setenv('DPM_RUN_ROOT', str(tmp_path / 'runs'))
     app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py')).run(timeout=30)

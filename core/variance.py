@@ -1,19 +1,44 @@
 """Backward-compatible, exact percentage variance report projections."""
+from decimal import Decimal, localcontext, ROUND_HALF_EVEN
+from uuid import uuid4
 
 
 PERCENT_SCALE = 12
 
 
+def _percentage_text(numerator, denominator, scale):
+    if numerator is None or denominator is None:
+        return None
+    numerator, denominator = Decimal(numerator), Decimal(denominator)
+    if denominator == 0:
+        return None
+    with localcontext() as context:
+        # Retain every input digit, including scale-30 amounts and rounding ties.
+        context.prec = 160 + scale
+        result = numerator * 100 / abs(denominator)
+        return format(result.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_EVEN), 'f')
+
+
+def register_percentage_function(connection):
+    # Python functions belong to their registering connection. A private name
+    # prevents another viewer/export connection from retaining a closed owner's
+    # callback. Saved views reference the stable, connection-local macro instead.
+    name = 'variance_percentage_' + uuid4().hex
+    connection.create_function(name, _percentage_text,
+                               ['VARCHAR', 'VARCHAR', 'INTEGER'], 'VARCHAR',
+                               null_handling='special')
+    connection.execute(f'''CREATE OR REPLACE TEMP MACRO exact_variance_percentage(n,d,s) AS
+        {name}(CAST(n AS VARCHAR),CAST(d AS VARCHAR),CAST(s AS INTEGER))''')
+
+
 def percentage_sql(numerator, denominator, scale=PERCENT_SCALE):
     """Return exact DECIMAL SQL for numerator / abs(denominator) * 100.
 
-    Inputs and the persisted result are explicitly DECIMAL; the result retains
-    ``scale`` fractional digits for export and is never stored as FLOAT/DOUBLE.
+    Original DECIMAL inputs are passed as exact text to decimal arithmetic;
+    the result retains ``scale`` fractional digits without FLOAT/DOUBLE division.
     """
-    return (f"CASE WHEN ({denominator}) IS NULL OR ({denominator})=0 OR ({numerator}) IS NULL "
-            f"THEN NULL ELSE CAST((CAST(({numerator}) AS DECIMAL(38,{scale})) / "
-            f"abs(CAST(({denominator}) AS DECIMAL(38,{scale})))) * CAST(100 AS DECIMAL(38,0)) "
-            f"AS DECIMAL(38,{scale})) END")
+    return (f'CAST(exact_variance_percentage(({numerator}),({denominator}),{scale}) '
+            f'AS DECIMAL(38,{scale}))')
 
 
 def enhanced_query(run, table):
@@ -26,8 +51,11 @@ def enhanced_query(run, table):
         if 'rating_variance_amount' not in columns:
             additions.append('rating_difference AS rating_variance_amount')
         if 'rating_variance_pct' not in columns:
-            eligible = ("status IN ('MATCHED_SAME_RATING','MATCHED_DIFFERENT_RATING') "
-                        "AND legacy_currency=saas_currency")
+            eligible = "status IN ('MATCHED_SAME_RATING','MATCHED_DIFFERENT_RATING')"
+            if {'legacy_currency', 'saas_currency'} <= set(columns):
+                eligible += ' AND legacy_currency=saas_currency'
+            # Older reports may omit currency columns. Their saved difference
+            # already encodes whether a comparable variance was available.
             additions.append('CASE WHEN ' + eligible + ' THEN ' +
                              percentage_sql('rating_difference', 'legacy_amount') +
                              ' END AS rating_variance_pct')

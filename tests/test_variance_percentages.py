@@ -2,10 +2,50 @@ import csv
 from decimal import Decimal
 
 from openpyxl import load_workbook
+import duckdb
+import pytest
 
+from core.engine import Run
 from core.reporting import export_all_records, export_all_records_xlsx, export_detail
-from core.variance import enhanced_query
+from core.schema import Settings
+from core.variance import enhanced_query, percentage_sql, register_percentage_function
 from tools.generate_samples import cdr
+
+
+@pytest.mark.parametrize('numerator,denominator,input_scale,expected', [
+    ('0.000000000000000000000001', '0.000000000000000000000003', 24, '33.333333333333'),
+    ('12345678901234567890.123456789012', '100', 12, '12345678901234567890.123456789012'),
+    ('1', '-2', 24, '50.000000000000'),
+    ('0.000000000000005', '1', 24, '0.000000000000'),
+    ('0.000000000000015', '1', 24, '0.000000000002'),
+    ('1', '0', 24, None),
+    (None, '1', 24, None),
+    ('1', None, 24, None),
+])
+def test_percentage_sql_preserves_original_decimal_precision(numerator, denominator, input_scale, expected):
+    with duckdb.connect() as connection:
+        register_percentage_function(connection)
+        query = percentage_sql('n', 'd')
+        value, data_type = connection.execute(f'''SELECT {query}, typeof({query}) FROM
+            (SELECT CAST(? AS DECIMAL(38,{input_scale})) AS n,
+                    CAST(? AS DECIMAL(38,{input_scale})) AS d)''', [numerator, denominator]).fetchone()
+    assert value == (Decimal(expected) if expected is not None else None)
+    assert data_type == 'DECIMAL(38,12)'
+
+
+def test_saved_variance_view_survives_other_connection_closing_and_reopen(tmp_path):
+    owner = Run.create(tmp_path / 'runs', Settings(memory_limit='128MB', threads=1))
+    directory = owner.directory
+    query = percentage_sql('1::DECIMAL(38,24)', '3::DECIMAL(38,24)')
+    owner.con.execute(f'CREATE VIEW percentage_probe AS SELECT {query} AS variance')
+    viewer = Run(directory)
+    try:
+        owner.close()
+        assert viewer.con.execute('SELECT * FROM percentage_probe').fetchone() == (Decimal('33.333333333333'),)
+    finally:
+        viewer.close()
+    with Run(directory) as reopened:
+        assert reopened.con.execute('SELECT * FROM percentage_probe').fetchone() == (Decimal('33.333333333333'),)
 
 
 def test_cdr_variance_positive_negative_zero_and_zero_baseline(run_pair):

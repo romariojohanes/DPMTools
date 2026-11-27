@@ -8,7 +8,21 @@ from time import perf_counter, sleep
 import duckdb
 
 from core.schema import Settings, quote
-from core.variance import enhanced_query
+from core.variance import enhanced_query, register_percentage_function
+
+
+def exact_filter_clause(columns, filters=None):
+    """Build the exact predicates shared by report pages and filtered exports."""
+    clauses, params = [], []
+    for key, value in (filters or {}).items():
+        if key not in columns:
+            raise ValueError('Unknown filter column.')
+        if value is None:
+            clauses.append(f'"{key}" IS NULL')
+        elif value != '':
+            clauses.append(f'"{key}" = ?')
+            params.append(value)
+    return (' WHERE ' + ' AND '.join(clauses) if clauses else ''), params
 
 
 class Run:
@@ -42,6 +56,7 @@ class Run:
                 'max_temp_directory_size': self.settings.max_temp_directory_size,
             },
         )
+        register_percentage_function(self.con)
         self.con.execute(f'SET memory_limit={quote(self.settings.memory_limit)}')
         # Investigation/export joins can otherwise allocate a hash buffer per worker.
         self.con.execute(f'SET threads={self.settings.threads if create else 1}')
@@ -130,16 +145,7 @@ class Run:
             raise ValueError('Unknown report table.')
         query = enhanced_query(self, table)
         columns = [r[0] for r in self.con.execute(f'DESCRIBE ({query})').fetchall()]
-        clauses, params = [], []
-        for key, value in (filters or {}).items():
-            if key not in columns:
-                raise ValueError('Unknown filter column.')
-            if value is None:
-                clauses.append(f'"{key}" IS NULL')
-            elif value != '':
-                clauses.append(f'"{key}" = ?')
-                params.append(value)
-        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        where, params = exact_filter_clause(columns, filters)
         # Stable tie-breaks prevent rows moving between pages when sort values repeat.
         tie_breaks = [c for c in ('PLMN', 'match_key', 'source', 'source_file', 'source_row', 'legacy_file', 'legacy_row', 'field',
                                   'HPMN', 'VPMN', 'CURRENCY', 'operator', 'metric', 'status', 'profile') if c in columns and c != sort]

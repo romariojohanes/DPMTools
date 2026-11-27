@@ -15,7 +15,8 @@ import streamlit as st
 
 from core.engine import Run
 from core.ingestion import inspect_headers, validate_header_mapping
-from core.reporting import REPORTS, DETAIL_TABLES, export_report, export_detail, export_all_records
+from core.reporting import (REPORTS, DETAIL_TABLES, EXCEL_MAX_ROWS, FILTERED_DOWNLOAD_LIMIT_BYTES,
+                            export_report, export_detail, export_all_records, export_filtered_records_xlsx)
 from core.schema import DATE_FORMATS, FIELDS, InputOptions, Settings, MATCH_PROFILES, canonical, resolve_inputs
 from core.workflow import execute
 from core.summary_revenue import (SUMMARY_FIELDS, SummaryInputOptions, execute_summary,
@@ -102,6 +103,52 @@ def request_detail_export(directory, table_name, output_format, filters=None):
     st.session_state['detail_export_request'] = (str(directory), table_name, output_format, filters or {})
 
 
+def filtered_export_worker(directory, filters, expected_rows):
+    with Run(directory) as export_run:
+        path, rows, digest = export_filtered_records_xlsx(export_run, filters, expected_rows=expected_rows)
+        return {'directory': str(export_run.directory), 'filters': filters, 'path': str(path),
+                'rows': rows, 'sha256': digest, 'sheets': max(1, (rows + EXCEL_MAX_ROWS - 2) // (EXCEL_MAX_ROWS - 1))}
+
+
+def request_filtered_export(directory, filters, expected_rows):
+    st.session_state.pop('filtered_export_result', None)
+    st.session_state.pop('filtered_export_error', None)
+    st.session_state['filtered_export_context'] = {'directory': str(directory), 'filters': dict(filters),
+                                                 'rows': expected_rows}
+    st.session_state['filtered_export_request'] = (str(directory), dict(filters), expected_rows)
+
+
+def filtered_export_controls(directory, filters, total, decimal_scale):
+    context = {'directory': str(directory), 'filters': filters, 'rows': total}
+    result = st.session_state.get('filtered_export_result')
+    current = result and all(result.get(key) == value for key, value in context.items())
+    st.caption(f'Filtered Excel export: all {total:,} matching records across every page. Financial values retain exact decimal text.')
+    st.caption(f'Rating Variance (%) = rating_difference / legacy_amount × 100, rounded to {decimal_scale} decimal places (half-even). Blank when the legacy amount is zero or the variance is unavailable.')
+    if total > EXCEL_MAX_ROWS - 1:
+        st.info(f'Excel allows {EXCEL_MAX_ROWS:,} rows per worksheet including the header. This export will automatically split into multiple worksheets.')
+    error = st.session_state.get('filtered_export_error')
+    if error and st.session_state.get('filtered_export_context') == context:
+        st.error('Filtered export failed: ' + error)
+    label = 'Download Filtered Records (Excel)'
+    if current and Path(result['path']).is_file():
+        path = Path(result['path'])
+        st.success(f"Verified {result['rows']:,} filtered records in {result['sheets']:,} worksheet(s).")
+        st.caption(f"SHA-256 {result['sha256']}")
+        st.code(str(path), language=None)
+        if path.stat().st_size <= FILTERED_DOWNLOAD_LIMIT_BYTES:
+            with path.open('rb') as handle:
+                st.download_button(label, handle, file_name=path.name,
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                   key='filtered_records_download', on_click='ignore')
+        else:
+            st.info(f'This file exceeds the {FILTERED_DOWNLOAD_LIMIT_BYTES / (1024 * 1024):g} MiB browser download limit. Open the verified local file at the path above.')
+    else:
+        st.button(label, key='prepare_filtered_records',
+                  disabled='filtered_export_future' in st.session_state,
+                  on_click=request_filtered_export, args=(directory, filters, total),
+                  help='Prepares all filtered records locally, then offers the verified Excel file for download.')
+
+
 def active_table_filters(key, fields):
     filters = {}
     for field in fields:
@@ -116,6 +163,11 @@ def active_table_filters(key, fields):
 if 'detail_export_request' in st.session_state and 'detail_export_future' not in st.session_state:
     request = st.session_state.pop('detail_export_request')
     st.session_state['detail_export_future'] = processing_pool().submit(detail_export_worker, *request)
+
+
+if 'filtered_export_request' in st.session_state and 'filtered_export_future' not in st.session_state:
+    request = st.session_state.pop('filtered_export_request')
+    st.session_state['filtered_export_future'] = processing_pool().submit(filtered_export_worker, *request)
 
 
 if st.session_state.pop('start_requested', False):
@@ -288,6 +340,7 @@ def table(run, name, key, operators=()):
             st.dataframe(display_rows(rows), hide_index=True, width='stretch')
     else:
         st.info('No rows on this page. Adjust the filters or page number.')
+    return filters, total
 
 
 if 'job_future' in st.session_state:
@@ -343,6 +396,23 @@ if 'detail_export_future' in st.session_state:
             selected_format = st.session_state.get('detail_export_active_format', 'selected format').upper()
             st.info(f'Complete {selected_format} detail export is running in the background.')
     detail_export_monitor()
+
+if 'filtered_export_future' in st.session_state:
+    @st.fragment(run_every=1)
+    def filtered_export_monitor():
+        future = st.session_state.get('filtered_export_future')
+        if future is None:
+            return
+        if future.done():
+            del st.session_state['filtered_export_future']
+            try:
+                st.session_state['filtered_export_result'] = future.result()
+            except Exception as exc:
+                st.session_state['filtered_export_error'] = str(exc)
+            st.rerun()
+        else:
+            st.info('Preparing and verifying all filtered CDR records in the background. You can continue browsing.')
+
 
 if page == 'New Reconciliation':
     st.header('New Reconciliation')
@@ -566,7 +636,8 @@ else:
                                                    key='all_records_download', on_click='ignore')
                         else:
                             st.info('This export exceeds 25 MB. Open the verified file at the local path above.')
-                table(run, 'cdr_details', 'cdr_details', ('HPMN', 'VPMN'))
+                filtered_selection, filtered_count = table(run, 'cdr_details', 'cdr_details', ('HPMN', 'VPMN'))
+                filtered_export_controls(run.directory, filtered_selection, filtered_count, run.settings.decimal_scale)
             elif page == 'Duplicate / Ambiguous Keys':
                 st.caption('No records in these groups have been paired. All source members are available below.')
                 table(run, 'ambiguous_records', 'ambiguous_records', ('HPMN', 'VPMN'))
@@ -577,3 +648,8 @@ else:
             st.header(f'{level} · {page}')
             st.caption('Counts and RATED_AMOUNT_TAP by operator and currency. Signed amount variance = SaaS − Legacy. One-source groups remain visible.')
             table(run, name, name, operators)
+
+# Render filter widgets before a completion-triggered rerun so Streamlit keeps
+# their state. An early rerun would discard widgets not yet visited in this run.
+if 'filtered_export_future' in st.session_state:
+    filtered_export_monitor()

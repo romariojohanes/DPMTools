@@ -1,10 +1,12 @@
 """Streaming Excel output; financial decimals are exact text, never Excel floats."""
 import csv
 import hashlib
-from decimal import Decimal
+from decimal import Decimal, localcontext, ROUND_HALF_EVEN
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
+from core.engine import exact_filter_clause
 from core.schema import quote
 from core.variance import enhanced_query
 
@@ -29,6 +31,8 @@ REPORTS = {
     'Revenue Variance Attribution': ['revenue_attribution'],
 }
 EXCEL_MAX_ROWS = 1_048_576
+# Streamlit buffers download data in memory; use the existing local-export cap.
+FILTERED_DOWNLOAD_LIMIT_BYTES = 25 * 1024 * 1024
 EXTRACT_LIMIT = 50_000
 DETAIL_TABLES = {'cdr_details', 'rating_differences', 'legacy_only', 'saas_only', 'duplicate_keys',
                  'ambiguous_records', 'field_differences', 'revenue_attribution', 'issues'}
@@ -116,11 +120,48 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None, filters=None
     destination = Path(destination or run.directory / 'reports')
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / 'CDR_Matching_Details_All_Records.xlsx'
+    query, parameters = _filtered_query(run, cdr_all_records_query(run), filters)
+    return _export_cdr_xlsx(run, target, query, parameters, checkpoint)
+
+
+def export_filtered_records_xlsx(run, filters=None, *, expected_rows=None, checkpoint=None):
+    """Export the table's exact selection without pagination or saved-run writes."""
+    if run.meta['status'] != 'COMPLETED':
+        raise ValueError('Record export requires a completed run.')
+    columns = [row[0] for row in run.con.execute('DESCRIBE cdr_details').fetchall()]
+    where, parameters = exact_filter_clause(columns, filters)
+    count = run.con.execute('SELECT count(*) FROM cdr_details' + where, parameters).fetchone()[0]
+    if expected_rows is not None and count != expected_rows:
+        raise ValueError(f'Filtered count changed: table displayed {expected_rows:,}, found {count:,}. Refresh the table and retry.')
+    # Keep d.* and the existing reporting projection, including columns in older
+    # completed runs. Never rebuild views, rerun matching, or save run metadata.
+    query = f'SELECT * FROM ({cdr_all_records_query(run)}) export_data{where}'
+    folder = run.directory / 'reports'
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f'CDR_Matching_Details_Filtered_{uuid4().hex[:12]}.xlsx'
+    return _export_cdr_xlsx(run, target, query, parameters, checkpoint, expected_rows=count,
+                           percentage_scale=run.settings.decimal_scale)
+
+
+def _rating_variance_percentage(legacy_amount, difference, scale):
+    if legacy_amount is None or legacy_amount == 0 or difference is None:
+        return None
+    with localcontext() as context:
+        # Accommodate both DECIMAL(38,scale) operands and a very small denominator.
+        context.prec = 80 + scale
+        return (difference * 100 / legacy_amount).quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_EVEN)
+
+
+def _export_cdr_xlsx(run, target, query, parameters, checkpoint=None, expected_rows=None, percentage_scale=None):
+    """Shared bounded-memory writer for existing and filtered CDR exports."""
     temporary = target.with_suffix('.tmp.xlsx')
     workbook = Workbook(write_only=True)
-    query, parameters = _filtered_query(run, cdr_all_records_query(run), filters)
     cursor = run.con.execute(query, parameters)
     headers = [column[0] for column in cursor.description]
+    add_percentage = percentage_scale is not None and 'Rating Variance (%)' not in headers
+    if add_percentage:
+        amount_index, difference_index = headers.index('legacy_amount'), headers.index('rating_difference')
+        headers.append('Rating Variance (%)')
     sheet = _sheet(workbook, 'CDR Matching Details', headers)
     _format_detail_sheet(sheet, headers)
     written = 0
@@ -128,12 +169,16 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None, filters=None
     try:
         while rows := cursor.fetchmany(2000):
             for row in rows:
+                if add_percentage:
+                    row = (*row, _rating_variance_percentage(row[amount_index], row[difference_index], percentage_scale))
                 if written and written % (EXCEL_MAX_ROWS - 1) == 0:
                     sheet = _sheet(workbook, f'CDR Details {written // (EXCEL_MAX_ROWS - 1) + 1}', headers)
                     _format_detail_sheet(sheet, headers)
                 sheet.append(list(_cells(sheet, row)))
                 written += 1
             _checkpoint(checkpoint, 'all_records_batch', rows_written=written)
+        if expected_rows is not None and written != expected_rows:
+            raise ValueError(f'Filtered export count mismatch: expected {expected_rows}, found {written}.')
         workbook.save(temporary)
         verification = load_workbook(temporary, read_only=True, data_only=False)
         try:
@@ -145,6 +190,9 @@ def export_all_records_xlsx(run, destination=None, checkpoint=None, filters=None
             verification.close()
         temporary.replace(target)
     except BaseException:
+        for sheet in workbook:
+            if not sheet.closed:
+                sheet.close()
         workbook.close()
         temporary.unlink(missing_ok=True)
         raise
